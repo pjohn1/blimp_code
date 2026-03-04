@@ -13,6 +13,7 @@
 import rclpy
 from rclpy.node import Node
 from blimp_msgs.msg import OptiTrackPose, GoalMsg
+from rcl_interfaces.msg import SetParametersResult
 
 import threading
 import socket
@@ -20,6 +21,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation as R
 import math
 import time
+import re
 
 import subprocess
 
@@ -31,6 +33,7 @@ sock.bind((LOCAL_IP,1511))
 sock.setblocking(True)
 
 data_lock = threading.Lock()
+AGENT_PATTERN = re.compile(r"^agent_\d+$")
 
 class OptiTrackNode(Node):
     def __init__(self):
@@ -42,27 +45,116 @@ class OptiTrackNode(Node):
         self.declare_parameter('goals',['agent_63','agent_61'])
         self.goals = self.get_parameter('goals').value
 
+        self.publishers_created = []
         self.publish_mapping = dict()
         self.agent_set = set()
-        # Maps each agent to the corresponding publisher for the pose
-        # Mod 2 as the list is [agent, port, agent, port, ...]
-        for a in range(len(self.agents)):
-            if a % 2 == 1:
-                self.agent_set.add(self.agents[a])
-                self.publish_mapping[self.agents[a]] = self.create_publisher(OptiTrackPose,f'/{self.agents[a]}/optitrack_node/pose',5)
-        
         self.goal_publishing = dict()
         self.goal_set = set()
-        # This corresponds to the physical goal (i.e. tracking wand) in OptiTrack
-        for g in range(len(self.goals)):
-            if g % 2 == 0:
-                self.goal_set.add(self.goals[g])
-                if self.goals[g] not in self.goal_publishing:
-                    self.goal_publishing[self.goals[g]] = [self.create_publisher(GoalMsg,f'/{self.goals[g+1]}/high_level_controller/goal',5)]
-                else:
-                    self.goal_publishing[self.goals[g]].append(self.create_publisher(GoalMsg,f'/{self.goals[g+1]}/high_level_controller/goal',5))
-        
-        
+        self._configure_mappings(self.agents, self.goals)
+        self.add_on_set_parameters_callback(self._on_set_parameters)
+
+    def _validate_agents(self, agents):
+        if len(agents) % 2 != 0:
+            return False, "Parameter 'agents' must contain port/agent pairs."
+        names = set()
+        for i in range(1, len(agents), 2):
+            name = str(agents[i]).strip()
+            if not AGENT_PATTERN.match(name):
+                return False, f"Invalid agent name '{name}'. Expected format agent_<id>."
+            if name in names:
+                return False, f"Duplicate agent name '{name}'."
+            names.add(name)
+        return True, ""
+
+    def _validate_goals(self, goals):
+        if len(goals) % 2 != 0:
+            return False, "Parameter 'goals' must contain goal/target pairs."
+        for i in range(0, len(goals), 2):
+            goal = str(goals[i]).strip()
+            target = str(goals[i + 1]).strip()
+            if not AGENT_PATTERN.match(goal) or not AGENT_PATTERN.match(target):
+                return False, "Goal entries must be formatted as agent_<id>."
+        return True, ""
+
+    def _destroy_dynamic_publishers(self):
+        for pub in self.publishers_created:
+            self.destroy_publisher(pub)
+        self.publishers_created = []
+
+    def _configure_mappings(self, agents, goals):
+        valid_agents, reason_agents = self._validate_agents(agents)
+        if not valid_agents:
+            raise ValueError(reason_agents)
+        valid_goals, reason_goals = self._validate_goals(goals)
+        if not valid_goals:
+            raise ValueError(reason_goals)
+
+        self._destroy_dynamic_publishers()
+        self.agents = list(agents)
+        self.goals = list(goals)
+        self.publish_mapping = {}
+        self.goal_publishing = {}
+        self.agent_set = set()
+        self.goal_set = set()
+
+        # list format is [port, agent, port, agent, ...]
+        for i in range(1, len(self.agents), 2):
+            agent = self.agents[i]
+            self.agent_set.add(agent)
+            pub = self.create_publisher(OptiTrackPose, f'/{agent}/optitrack_node/pose', 5)
+            self.publish_mapping[agent] = pub
+            self.publishers_created.append(pub)
+
+        for i in range(0, len(self.goals), 2):
+            goal_agent = self.goals[i]
+            target_agent = self.goals[i + 1]
+            self.goal_set.add(goal_agent)
+            if goal_agent not in self.goal_publishing:
+                self.goal_publishing[goal_agent] = []
+            pub = self.create_publisher(
+                GoalMsg, f'/{target_agent}/high_level_controller/goal', 5
+            )
+            self.goal_publishing[goal_agent].append(pub)
+            self.publishers_created.append(pub)
+
+    def _on_set_parameters(self, params):
+        next_agents = list(self.agents)
+        next_goals = list(self.goals)
+        changed = False
+
+        for param in params:
+            if param.name == 'agents':
+                if param.type_ != param.Type.STRING_ARRAY:
+                    return SetParametersResult(
+                        successful=False,
+                        reason="Parameter 'agents' must be a string array.",
+                    )
+                valid, reason = self._validate_agents(param.value)
+                if not valid:
+                    return SetParametersResult(successful=False, reason=reason)
+                next_agents = list(param.value)
+                changed = True
+            elif param.name == 'goals':
+                if param.type_ != param.Type.STRING_ARRAY:
+                    return SetParametersResult(
+                        successful=False,
+                        reason="Parameter 'goals' must be a string array.",
+                    )
+                valid, reason = self._validate_goals(param.value)
+                if not valid:
+                    return SetParametersResult(successful=False, reason=reason)
+                next_goals = list(param.value)
+                changed = True
+
+        if changed:
+            try:
+                self._configure_mappings(next_agents, next_goals)
+            except Exception as exc:
+                return SetParametersResult(successful=False, reason=str(exc))
+            self.get_logger().info(
+                f"Updated OptiTrack mappings: agents={next_agents}, goals={next_goals}"
+            )
+        return SetParametersResult(successful=True)
     def publish_goal(self,goal_values,publisher):
         msg = GoalMsg() #Custom goal message defined in blimp_msgs/msg/GoalMsg.msg
         msg.id = int(goal_values[-1])

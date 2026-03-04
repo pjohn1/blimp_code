@@ -7,6 +7,7 @@
 import rclpy
 from rclpy.node import Node
 from blimp_msgs.msg import GoalMsg, OptiTrackPose
+from rcl_interfaces.msg import SetParametersResult
 
 import threading
 import numpy as np
@@ -14,9 +15,11 @@ import numpy as np
 from scipy import sparse
 import networkx
 import osqp
+import re
 
 # NOMINAL_V = 1.5
 MAX_V = 1.0
+AGENT_PATTERN = re.compile(r"^agent_\d+$")
 
 class CBF(Node):
     def __init__(self):
@@ -24,9 +27,11 @@ class CBF(Node):
 
         self.declare_parameter('agents',['COM7','agent_61'])
         a = self.get_parameter('agents').value
-        self.agents = [a[i] for i in range(len(a)) if i%2 != 0]
 
-        self.num_blimps = len(self.agents)
+        self.agents = []
+        self.agents_param = []
+        self.goals_param = []
+        self.num_blimps = 0
 
         self.declare_parameter('goals',['agent_63','agent_61'])
         g = self.get_parameter('goals').value
@@ -35,9 +40,12 @@ class CBF(Node):
         self.declare_parameter('lookahead',0.5)
         self.lookahead = self.get_parameter('lookahead').value
 
-        self.poses = {a:None for a in self.agents}
-        self.goals = {a:None for a in self.agents}
-        self.publishers_ = {a:() for a in self.agents}
+        self.poses = {}
+        self.goals = {}
+        self.publishers_ = {}
+        self.pose_subscribers = []
+        self.goal_subscribers = []
+        self.config_lock = threading.Lock()
 
         self.declare_parameter('dmin',1.5)
         self.dmin = self.get_parameter('dmin').value
@@ -64,9 +72,8 @@ class CBF(Node):
         self.before_nod = []
 
         ##### NOD PARAMETERS ##########
-        G = networkx.cycle_graph(len(self.agents))
-        self.A = lambda i: G.neighbors(i)
-        self.d = lambda i: G.degree(i)
+        self.A = lambda i: []
+        self.d = lambda i: 0
         self.nu_low = 0.2
         self.nu_high = 1.2
         self.d_th = self.dmin*1.25
@@ -88,16 +95,142 @@ class CBF(Node):
         self.solver = osqp.OSQP(verbose=False)
         ###################################
 
-        for a in self.agents:
-            self.create_subscription(OptiTrackPose,f'/{a}/optitrack_node/pose',self.run_cbf,5)
-            self.create_subscription(GoalMsg,f'/{a}/high_level_controller/goal',self.update_goals,5)
-            self.publishers_[a] = self.create_publisher(GoalMsg,f'/{a}/controller/goal',5)
+        self._configure_agents_and_goals(a, g)
+        self.add_on_set_parameters_callback(self._on_set_parameters)
+
+    def _validate_agents(self, agents):
+        if len(agents) % 2 != 0:
+            return False, "Parameter 'agents' must contain port/agent pairs."
+        names = set()
+        for i in range(1, len(agents), 2):
+            name = str(agents[i]).strip()
+            if not AGENT_PATTERN.match(name):
+                return False, f"Invalid agent name '{name}'. Expected format agent_<id>."
+            if name in names:
+                return False, f"Duplicate agent name '{name}'."
+            names.add(name)
+        return True, ""
+
+    def _validate_goals(self, goals):
+        if len(goals) % 2 != 0:
+            return False, "Parameter 'goals' must contain goal/target pairs."
+        for i in range(0, len(goals), 2):
+            goal = str(goals[i]).strip()
+            target = str(goals[i + 1]).strip()
+            if not AGENT_PATTERN.match(goal) or not AGENT_PATTERN.match(target):
+                return False, "Goal entries must be formatted as agent_<id>."
+        return True, ""
+
+    def _reset_runtime_buffers(self):
+        self.received_goals = False
+        self.received_poses = False
+        self.nominals = []
+        self.adjusted = []
+        self.times = []
+        self.opinion_states = []
+        self.attentions = []
+        self.biases = []
+        self.distances = []
+        self.before_nod = []
+        self.opinions = None
+        self.last_time = None
+        self.u0 = None
+
+    def _clear_dynamic_endpoints(self):
+        for sub in self.pose_subscribers:
+            self.destroy_subscription(sub)
+        for sub in self.goal_subscribers:
+            self.destroy_subscription(sub)
+        for pub in self.publishers_.values():
+            self.destroy_publisher(pub)
+        self.pose_subscribers = []
+        self.goal_subscribers = []
+        self.publishers_ = {}
+
+    def _configure_agents_and_goals(self, agents_param, goals_param):
+        valid_agents, reason_agents = self._validate_agents(agents_param)
+        if not valid_agents:
+            raise ValueError(reason_agents)
+        valid_goals, reason_goals = self._validate_goals(goals_param)
+        if not valid_goals:
+            raise ValueError(reason_goals)
+
+        with self.config_lock:
+            self._clear_dynamic_endpoints()
+
+            self.agents_param = list(agents_param)
+            self.goals_param = list(goals_param)
+            self.agents = [agents_param[i] for i in range(1, len(agents_param), 2)]
+            self.num_blimps = len(self.agents)
+            self.goal_map = {goals_param[i]: goals_param[i + 1] for i in range(0, len(goals_param), 2)}
+
+            self.poses = {a: None for a in self.agents}
+            self.goals = {a: None for a in self.agents}
+            for a in self.agents:
+                pose_sub = self.create_subscription(
+                    OptiTrackPose, f'/{a}/optitrack_node/pose', self.run_cbf, 5
+                )
+                goal_sub = self.create_subscription(
+                    GoalMsg, f'/{a}/high_level_controller/goal', self.update_goals, 5
+                )
+                self.pose_subscribers.append(pose_sub)
+                self.goal_subscribers.append(goal_sub)
+                self.publishers_[a] = self.create_publisher(GoalMsg, f'/{a}/controller/goal', 5)
+
+            G = networkx.cycle_graph(len(self.agents))
+            self.A = lambda i: G.neighbors(i)
+            self.d = lambda i: G.degree(i)
+            self._reset_runtime_buffers()
+
+    def _on_set_parameters(self, params):
+        next_agents = list(self.agents_param)
+        next_goals = list(self.goals_param)
+        changed = False
+
+        for param in params:
+            if param.name == 'agents':
+                if param.type_ != param.Type.STRING_ARRAY:
+                    return SetParametersResult(
+                        successful=False,
+                        reason="Parameter 'agents' must be a string array.",
+                    )
+                valid, reason = self._validate_agents(param.value)
+                if not valid:
+                    return SetParametersResult(successful=False, reason=reason)
+                next_agents = list(param.value)
+                changed = True
+            elif param.name == 'goals':
+                if param.type_ != param.Type.STRING_ARRAY:
+                    return SetParametersResult(
+                        successful=False,
+                        reason="Parameter 'goals' must be a string array.",
+                    )
+                valid, reason = self._validate_goals(param.value)
+                if not valid:
+                    return SetParametersResult(successful=False, reason=reason)
+                next_goals = list(param.value)
+                changed = True
+
+        if changed:
+            try:
+                self._configure_agents_and_goals(next_agents, next_goals)
+            except Exception as exc:
+                return SetParametersResult(successful=False, reason=str(exc))
+            self.get_logger().info(
+                f"Updated CBF mappings: agents={next_agents}, goals={next_goals}"
+            )
+        return SetParametersResult(successful=True)
 
     
     def update_goals(self,msg):
         id_ = msg.id
         string_id = f'agent_{id_}'
-        self.goals[self.goal_map[string_id]] = np.array([msg.x,msg.y,1.75])#,msg.roll,msg.pitch,msg.yaw])#,msg.ux,msg.uy,msg.uz,msg.wx,msg.wy,msg.wz])
+        if string_id not in self.goal_map:
+            return
+        target_agent = self.goal_map[string_id]
+        if target_agent not in self.goals:
+            return
+        self.goals[target_agent] = np.array([msg.x,msg.y,1.75])#,msg.roll,msg.pitch,msg.yaw])#,msg.ux,msg.uy,msg.uz,msg.wx,msg.wy,msg.wz])
         if not self.received_goals and all([self.goals[i] is not None for i in self.goals]):
             self.received_goals = True
         if self.received_goals:

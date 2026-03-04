@@ -1,7 +1,8 @@
 # your_pkg/launch/multi_start_launch.py
 from launch import LaunchDescription
-from launch.actions import ExecuteProcess, RegisterEventHandler, GroupAction
-from launch.event_handlers import OnProcessExit, OnShutdown
+from launch.actions import ExecuteProcess, GroupAction, DeclareLaunchArgument
+from launch.conditions import IfCondition
+from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node, PushRosNamespace
 
 
@@ -56,12 +57,28 @@ def generate_launch_description():
         parameters=[{"agents":agents,'goals':goal_map,"dmin":1.0}]
     )
 
+    setup_gui_arg = DeclareLaunchArgument(
+        'start_setup_gui',
+        default_value='false',
+        description='Start the setup GUI node for runtime blimp configuration',
+    )
+
+    setup_gui_node = Node(
+        package='blimp_ros',
+        executable='setup_gui_node',
+        name='setup_gui_node',
+        output='screen',
+        condition=IfCondition(LaunchConfiguration('start_setup_gui')),
+    )
+
     ld = LaunchDescription()
 
+    ld.add_action(setup_gui_arg)
     ld.add_action(start_windows_forwarder)
     ld.add_action(serial_node)  
     ld.add_action(optitrack_node)  
     ld.add_action(cbf_node)
+    ld.add_action(setup_gui_node)
 
     for a in range(len(agents)):
         if a % 2 == 1:

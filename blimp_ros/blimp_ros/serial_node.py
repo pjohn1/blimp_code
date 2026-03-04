@@ -3,11 +3,15 @@ import struct
 import threading
 import struct
 import time
+import re
 
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import Float32MultiArray
 import numpy as np
+from rcl_interfaces.msg import SetParametersResult
+
+AGENT_PATTERN = re.compile(r"^agent_\d+$")
 
 class SerialNode(Node):
     def __init__(self):
@@ -34,16 +38,94 @@ class SerialNode(Node):
 
         self.declare_parameter('agents',['COM7','agent_61']) #This gets overwritten by launch file
         a = self.get_parameter('agents').value
-        
+
+        self.config_lock = threading.Lock()
+        self.voltage_subscribers = []
+        self.mapping_dict = {}
+        self._configure_agents(a)
+        self.add_on_set_parameters_callback(self._on_set_parameters)
+
+    def _validate_agents(self, agents):
+        if len(agents) % 2 != 0:
+            return False, "Parameter 'agents' must contain port/agent pairs."
+        ports = set()
+        names = set()
+        for i in range(0, len(agents), 2):
+            port = str(agents[i]).strip()
+            name = str(agents[i + 1]).strip()
+            if not port:
+                return False, "Serial port cannot be empty."
+            if not AGENT_PATTERN.match(name):
+                return False, f"Invalid agent name '{name}'. Expected format agent_<id>."
+            if port in ports:
+                return False, f"Duplicate serial port '{port}'."
+            if name in names:
+                return False, f"Duplicate agent name '{name}'."
+            ports.add(port)
+            names.add(name)
+        return True, ""
+
+    def _close_all_serial(self):
+        for ser in self.mapping_dict.values():
+            if ser is not None and ser.is_open:
+                ser.close()
         self.mapping_dict = {}
 
-        # Maps each agent to the corresponding serial port, initializes the subscribers for reading voltage commands
-        for i in range(len(a)-1):
-            if i%2 == 0:
-                sub = self.create_subscription(Float32MultiArray,f'/{a[i+1]}/serial/voltages',self.write_motor_commands,10)
-                ser = serial.Serial(a[i],921600,timeout=0.1,bytesize=8, parity='N', stopbits=1,
-                    write_timeout=1, xonxoff=False, rtscts=False, dsrdtr=False)
-                self.mapping_dict[a[i+1]] = ser
+    def _destroy_all_subscriptions(self):
+        for sub in self.voltage_subscribers:
+            self.destroy_subscription(sub)
+        self.voltage_subscribers = []
+
+    def _configure_agents(self, agents):
+        valid, reason = self._validate_agents(agents)
+        if not valid:
+            raise ValueError(reason)
+
+        with self.config_lock:
+            self._destroy_all_subscriptions()
+            self._close_all_serial()
+
+            for i in range(0, len(agents), 2):
+                port = str(agents[i]).strip()
+                agent = str(agents[i + 1]).strip()
+                sub = self.create_subscription(
+                    Float32MultiArray,
+                    f'/{agent}/serial/voltages',
+                    self.write_motor_commands,
+                    10,
+                )
+                ser = serial.Serial(
+                    port,
+                    921600,
+                    timeout=0.1,
+                    bytesize=8,
+                    parity='N',
+                    stopbits=1,
+                    write_timeout=1,
+                    xonxoff=False,
+                    rtscts=False,
+                    dsrdtr=False,
+                )
+                self.voltage_subscribers.append(sub)
+                self.mapping_dict[agent] = ser
+
+    def _on_set_parameters(self, params):
+        for param in params:
+            if param.name == 'agents':
+                if param.type_ != param.Type.STRING_ARRAY:
+                    return SetParametersResult(
+                        successful=False,
+                        reason="Parameter 'agents' must be a string array.",
+                    )
+                valid, reason = self._validate_agents(param.value)
+                if not valid:
+                    return SetParametersResult(successful=False, reason=reason)
+                try:
+                    self._configure_agents(param.value)
+                except Exception as exc:
+                    return SetParametersResult(successful=False, reason=str(exc))
+                self.get_logger().info(f"Updated serial agent mapping: {list(param.value)}")
+        return SetParametersResult(successful=True)
 
     
     def write_motor_commands(self, msg):
@@ -62,7 +144,11 @@ class SerialNode(Node):
         to_send = f'{uid},{msg_},{pwm_1},{pwm_2},{pwm_3},{pwm_4},{pwm_5},{pwm_6},{signal},\n' #Newline sends command
         to_send = to_send.encode('utf-8')
 
-        ser = self.mapping_dict[ns]
+        with self.config_lock:
+            ser = self.mapping_dict.get(ns)
+        if ser is None:
+            self.get_logger().warn(f"Received command for unknown namespace '{ns}'")
+            return
         ser.write(to_send)
         ser.flush() #flush buffer, commands send instantly and we do not want buildup
 
@@ -93,7 +179,7 @@ class SerialNode(Node):
                 # t0 = t
     
     def shutdown(self):
-        for ns in self.mapping_dict:
+        for ns in list(self.mapping_dict.keys()):
             ser = self.mapping_dict[ns]
             for i in range(5): #Send multiple times in case the first one gets lost
                 to_send = f'0,MOTORCTRL,0.0,0.0,0.0,0.0,0.0,0.0,n,\n'

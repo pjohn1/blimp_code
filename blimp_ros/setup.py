@@ -32,7 +32,8 @@ setup(
             'serial_node = blimp_ros.serial_node:main',
             'high_level_controller = blimp_ros.high_level_controller:main',
             'cbf = blimp_ros.cbf:main',
-            'teleop_node = blimp_ros.teleop_node:main'
+            'teleop_node = blimp_ros.teleop_node:main',
+            'setup_gui_node = blimp_ros.setup_gui_node:main'
         ],
     },
 )
