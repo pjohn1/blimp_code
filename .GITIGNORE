@@ -1,0 +1,12 @@
+blimp_ros/*.txt
+blimp_ros/build
+blimp_ros/install
+blimp_ros/log
+blimp_sim/*.txt
+blimp_sim/build
+blimp_sim/install
+blimp_sim/log
+blimp_msgs/build
+blimp_msgs/install
+blimp_msgs/log
+./*.png
