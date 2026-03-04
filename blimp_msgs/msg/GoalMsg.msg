@@ -1,0 +1,13 @@
+int32 id
+float64 x
+float64 y
+float64 z
+float64 roll
+float64 pitch
+float64 yaw
+float64 ux
+float64 uy
+float64 uz
+float64 wx
+float64 wy
+float64 wz

@@ -9,4 +9,11 @@ blimp_sim/log
 blimp_msgs/build
 blimp_msgs/install
 blimp_msgs/log
-./*.png
+*.png
+blimp/
+__pycache__/
+*.pyc
+
+# ROS bags
+*.mcap
+rosbag2_*/

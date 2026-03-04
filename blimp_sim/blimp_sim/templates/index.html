@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Smooth Eye Tracker with Face Expressions</title>
+    <style>
+      :root {
+        --white: #fbfdff;
+        --blue: #5fd3ff;
+        --blue-dark: #38a5d6;
+        --dark-blue: #106d98;
+        --shadow: rgba(0, 0, 0, 0.35);
+        background: #111;
+      }
+      body {
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        height: 100vh;
+        overflow: hidden;
+      }
+      #faceCanvas {
+        border: 10px solid var(--blue-dark);
+        width: 500px;
+        height: 300px;
+        background: radial-gradient(circle at 50% 30%, #ffffff, #e5faff 70%);
+        border-radius: 170px;
+        padding: 20px;
+        display: flex;
+        flex-direction: column;
+        box-shadow: inset 0 -8px 20px rgba(0, 0, 0, 0.05);
+      }
+      .eyes {
+        width: 500px;
+        height: 220px;
+        background: transparent;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+      }
+      .eye {
+        width: 200px;
+        height: 210px;
+        background: radial-gradient(var(--dark-blue), var(--blue-dark));
+        border: 5px solid #111;
+        border-radius: 50%;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        position: relative;
+        overflow: visible;
+      }
+      .iris {
+        width: 180px;
+        height: 200px;
+        background: radial-gradient(
+          circle at 35% 30%,
+          #bff6ff 0%,
+          var(--blue) 35%,
+          var(--blue-dark) 100%
+        );
+        border-radius: 50%;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        position: relative;
+        box-shadow: inset 0 -10px 15px rgba(0, 0, 0, 0.15);
+      }
+      .pupil {
+        width: 100px;
+        height: 140px;
+        border-radius: 50%;
+        background: radial-gradient(
+          circle at 35% 35%,
+          rgba(0, 0, 0, 0.95) 0%,
+          rgba(0, 0, 0, 0.8) 40%,
+          rgba(0, 0, 0, 0.6) 100%
+        );
+        position: absolute;
+        top: 50%;
+        left: 50%;
+        transform: translate(-50%, -50%);
+        will-change: transform;
+        transition: none;
+      }
+      .whites {
+        background: white;
+        width: 30px;
+        height: 30px;
+        border-radius: 50%;
+        top: 40%;
+        left: 40%;
+        transform: translate(-50%, -50%);
+        will-change: transform;
+        position: absolute;
+        z-index: 20;
+      }
+      .mouth {
+        justify-content: center;
+        margin-left: auto;
+        margin-right: auto;
+        width: 90px;
+        height: 50px;
+        border-radius: 0 0 60px 60px;
+        background: radial-gradient(
+          circle at 50% 10%,
+          #0d5965 0%,
+          #03323e 60%,
+          #000000 100%
+        );
+        box-shadow: inset 0 -8px 12px rgba(0, 0, 0, 0.1);
+      }
+      video {
+        display: none;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="faceCanvas">
+      <div class="eyes">
+        <div class="eye">
+          <div class="iris"></div>
+          <div class="pupil"></div>
+          <div class="whites"></div>
+        </div>
+        <div class="eye">
+          <div class="iris"></div>
+          <div class="pupil"></div>
+          <div class="whites"></div>
+        </div>
+      </div>
+      <div class="mouth"></div>
+    </div>
+
+    <script src="//cdnjs.cloudflare.com/ajax/libs/socket.io/3.1.3/socket.io.min.js"></script>
+    <script type="module">
+      const canvas = document.getElementById("faceCanvas");
+//      const ctx = canvas.getContext("2d");
+      const pupils = document.querySelectorAll(".pupil");
+      const socket = io();
+
+      // ---- CONFIG ----
+      // The resolution your model/camera outputs coordinates in.
+      // If your model uses 256x256 frames (like your TFLite), set these to 256.
+      // If your server already scales to canvas size, set to canvas.width/height.
+      const sourceWidth = 300;
+      const sourceHeight = 300;
+
+      // maximum pupil movement (px) from center inside each eye
+      const MAX_OFFSET_X = 40;
+      const MAX_OFFSET_Y = 18;
+
+      // smoothing factor for lerp (0..1). Lower = smoother/slower
+      const SMOOTHING = 0.15;
+
+      // ---- state ----
+      let targetNormX = 0; // normalized -1..1
+      let targetNormY = 0;
+      let smoothX = 0; // smoothed normalized
+      let smoothY = 0;
+
+      // draw face (unchanged)
+      let faceDetected = false;
+
+      window.onerror = function (msg, url, line, col, error) {
+          fetch("/js-error", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                  message: msg,
+                  url: url,
+                  line: line,
+                  col: col,
+                  stack: error?.stack
+              })
+          });
+      };
+
+      // Single animation loop — lerp smooth values toward target and apply transform
+      function animateEyes() {
+        // lerp normalized coordinates
+        //   console.log(targetNormX, targetNormY);
+        smoothX += (targetNormX - smoothX) * SMOOTHING;
+        smoothY += (targetNormY - smoothY) * SMOOTHING;
+
+        //   convert normalized (-1..1) to pixel offsets and clamp
+        const offsetX = Math.max(
+          -MAX_OFFSET_X,
+          Math.min(MAX_OFFSET_X, smoothX * MAX_OFFSET_X)
+        );
+        const offsetY = Math.max(
+          -MAX_OFFSET_Y,
+          Math.min(MAX_OFFSET_Y, smoothY * MAX_OFFSET_Y)
+        );
+          console.log(offsetX, offsetY);
+        // Apply transform relative to center: keep translate(-50%,-50%) baseline then move
+          console.log(smoothX, smoothY);
+        pupils.forEach((pupil) => {
+          pupil.style.transform = `translate(-50%, -50%) translate(${offsetX}px, ${
+            0.1 * offsetY
+          }px)`;
+        });
+
+        requestAnimationFrame(animateEyes);
+      }
+      requestAnimationFrame(animateEyes);
+
+      // Helper: map incoming pixel coords to normalized -1..1
+      function mapToNormalized(pxX, pxY) {
+        // center at 0: pxX/sourceWidth in 0..1 -> -1..1
+        const nx = (pxX / sourceWidth - 0.5) * 2;
+        const ny = (pxY / sourceHeight - 0.5) * 2;
+        // Optionally invert y depending on coordinate system (camera top-left=0)
+        // In most cases top=0 means up, so we want negative -> look up. Keep as is or flip:
+        return { nx, ny };
+      }
+
+      // socket events: set the target normalized coords only
+      socket.on("bbox_update", (data) => {
+        // if (data && typeof data === "number" && typeof data.y === "number") {
+        faceDetected = true;
+        console.log(data)
+        const { nx, ny } = mapToNormalized(data.x, data.y);
+        // Optionally clamp the normalized values to [-1,1]
+        targetNormX = -Math.max(-1, Math.min(1, nx));
+        targetNormY = Math.max(-1, Math.min(1, ny));
+        // } else {
+        //   // No bbox: relax to center
+        //   faceDetected = false;
+        //   targetNormX = 0;
+        //   targetNormY = 0;
+        // }
+      });
+
+      // debug connect
+      socket.on("connect", () => console.log("socket connected"));
+    </script>
+  </body>
+</html>
