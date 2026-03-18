@@ -2,7 +2,7 @@ from setuptools import find_packages, setup
 import os
 from glob import glob
 
-package_name = 'blimp_sim'
+package_name = 'blimp_clean'
 
 setup(
     name=package_name,
@@ -12,13 +12,12 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
-        (os.path.join('share', package_name, 'launch'), glob('launch/*.py')),
-        (os.path.join('share', package_name, 'map'), glob('map/*.py')),
+        (os.path.join('share', package_name), glob('launch/*launch.[pxy][yma]*')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
     maintainer='c3',
-    maintainer_email='c3@todo.todo',
+    maintainer_email='P_J_Johnson@hotmail.com',
     description='TODO: Package description',
     license='TODO: License declaration',
     extras_require={
@@ -28,10 +27,10 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'map_publisher = blimp_sim.map_publisher:main',
-            'update_control = blimp_sim.update_control:main',
-            'random_voltage_control = blimp_sim.random_voltage_control:main',
-            'sim_run = blimp_sim.sim_run:main',
+            'setup_gui_node = blimp_clean.setup_gui_node:main',
+            'serial_node = blimp_clean.serial_node:main',
+            'optitrack_node = blimp_clean.optitrack_node:main',
+            'teleop_receiver = blimp_clean.teleop_receiver:main',
         ],
     },
 )

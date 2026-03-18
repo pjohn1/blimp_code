@@ -2,7 +2,7 @@
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import Float32MultiArray, Int32, Bool
-from blimp_msgs.msg import OptiTrackPose, GoalMsg
+from blimp_msgs.msg import OptiTrackPose, GoalMsg, MotorMsg
 from rcl_interfaces.msg import SetParametersResult
 
 import numpy as np
@@ -117,27 +117,18 @@ class ControllerNode(Node):
     There are a few controller iterations, feel free to use
     whichever is best
     '''
-    def __init__(self):
+    def __init__(self, ns, com_port):
 
         ## ROS NODE PARAMS #################
-        super().__init__("controller_node")
-        self.ns = self.get_namespace()
-        self.declare_parameter('agent_name', '')
-        configured_name = str(self.get_parameter('agent_name').value).strip()
-        self.active_agent_name = configured_name if configured_name else self.ns.strip('/')
-        self.publisher = None
-        self.subscriber = None
-        self.telemetry = None
-        self.stop_subscriber = None
-        self._configure_io(self.active_agent_name)
-        self.add_on_set_parameters_callback(self._on_set_parameters)
+        super().__init__(f'controller_node',namespace = ns)
+        self.get_logger().info(f"ControllerNode initialized for {ns}")
+        self.com_port = com_port
         ####################################
+        self.publisher = self.create_publisher(MotorMsg,'motor_cmd',5)
+        self.subscriber = self.create_subscription(GoalMsg,f'controller/goal',self.update_goal,5)
+        self.telemetry = self.create_subscription(OptiTrackPose,f'optitrack_node/pose',self.controller,5)
+        self.fly_to_goal_subscriber = self.create_subscription(Bool, "/fly_to_goal", self.update_fly_to_goal, 5)
 
-
-        ###### CBF START ##############
-        self.start_cbf = False
-        self.create_subscription(Int32,f'/start_cbf',self.manage_cbf,5)
-        
         ##### CONTROLLERS #############
         # self.alt_controller = LQR(u0_alt,A_alt,B_alt,Q_alt,R_alt,self)
         self.alt_controller = MPC(u0_alt,A_alt,B_alt,Q_alt,R_alt,5,self)
@@ -145,27 +136,12 @@ class ControllerNode(Node):
         # self.yaw_controller = LQR(u0_yaw,A_yaw,B_yaw,Q_yaw,R_yaw,self)
         self.pitch_controller = MPC_pitch(u0_pitch,A_pitch,B_pitch,Q_pitch,R_pitch,5,self)
         self.station_keeping = LQR(np.array([0.0,0.0]),A_sk,B_sk,Q_sk,R_sk,self)
-
-        ###### MOTOR MIXER PARAMS ########
-        #lowkey not working, ideally just rotation matrices based on current yaw
-        self.rotation_matrix = lambda yaw: np.array(
-            [
-                [-np.cos(yaw),-np.sin(yaw)],
-                [-np.sin(yaw),np.cos(yaw)]
-            ])
-        d = np.deg2rad(45)
-        self.u_i = np.array(
-            [
-                [np.cos(d), np.sin(d)], #FL
-                [np.cos(-d), np.sin(-d)], #FR
-                [np.cos(3*np.pi/4),  np.sin(3*np.pi/4)],  # BR
-                [np.cos(-3*np.pi/4), np.sin(-3*np.pi/4)]  # BL
-            ]
-        )
-
         ###### PARAMETERS ################
 
+
+
         self.received_goal = False
+        self.fly_to_goal = False
         self.xs = []
         self.ys = []
         self.alts = []
@@ -174,119 +150,37 @@ class ControllerNode(Node):
         self.ts = []
 
         self.last_rates = [0.0,0.0,0.0,0.0,0.0] #vx,vy,vz,wy,wz
-        self.temp_goal_log_count = 0
-        self.temp_goal_log_last_t = 0.0
-
-    def _is_valid_agent_name(self, name):
-        return len(name) > 0 and name.startswith('agent_') and name.split('_')[-1].isdigit()
-
-    def _configure_io(self, agent_name):
-        if self.publisher is not None:
-            self.destroy_publisher(self.publisher)
-            self.publisher = None
-        if self.subscriber is not None:
-            self.destroy_subscription(self.subscriber)
-            self.subscriber = None
-        if self.telemetry is not None:
-            self.destroy_subscription(self.telemetry)
-            self.telemetry = None
-        if self.stop_subscriber is not None:
-            self.destroy_subscription(self.stop_subscriber)
-            self.stop_subscriber = None
-
-        if not self._is_valid_agent_name(agent_name):
-            self.active_agent_name = ''
-            self.get_logger().warn(
-                f"Invalid/empty agent_name '{agent_name}'. Controller IO disabled until updated."
-            )
-            return
-
-        self.active_agent_name = agent_name
-        self.publisher = self.create_publisher(
-            Float32MultiArray, f"/{self.active_agent_name}/serial/voltages", 5
-        )
-        self.subscriber = self.create_subscription(
-            GoalMsg, f"/{self.active_agent_name}/controller/goal", self.update_goal, 5
-        )
-        self.telemetry = self.create_subscription(
-            OptiTrackPose, f"/{self.active_agent_name}/optitrack_node/pose", self.controller, 5
-        )
-        self.stop_subscriber = self.create_subscription(
-            Bool, f"/{self.active_agent_name}/controller/stop", self.stop_controller, 5
-        )
-        self.get_logger().info(
-            f"Controller endpoints configured for {self.active_agent_name}"
-        )
-
-    def _on_set_parameters(self, params):
-        for param in params:
-            if param.name == 'agent_name':
-                if param.type_ != param.Type.STRING:
-                    return SetParametersResult(
-                        successful=False,
-                        reason="Parameter 'agent_name' must be a string.",
-                    )
-                name = str(param.value).strip()
-                if name and not self._is_valid_agent_name(name):
-                    return SetParametersResult(
-                        successful=False,
-                        reason=f"Invalid agent_name '{name}', expected agent_<id>.",
-                    )
-                self._configure_io(name)
-                return SetParametersResult(successful=True)
-        return SetParametersResult(successful=True)
-
-    def manage_cbf(self,msg):
-        # runs the cbf, simple subscriber that starts the calculation
-        if msg.data == 1:
-            self.start_cbf = True
-        else:
-            self.start_cbf = False
-
-    def stop_controller(self, msg):
-        if not msg.data:
-            return
-        self.received_goal = False
-        self.get_logger().info(
-            f"[TEMP_TEST_TRACE] low_level_controller stop received; solver gated off for {self.active_agent_name}"
-        )
+        
+    def update_fly_to_goal(self, msg):
+        self.fly_to_goal = msg.data
 
     def update_goal(self,msg):
         self.received_goal = True
         self.x_goal = np.array([msg.x, msg.ux])
         self.y_goal = np.array([msg.y,msg.uy])
         self.alt_goal = np.array([msg.z,msg.uz])
-        self.yaw_goal = np.array([msg.yaw,msg.wz])
+        # self.yaw_goal = np.array([yaw_goal,msg.wz])
         self.pitch_goal = np.array([msg.pitch,msg.wy])
 
         self.pitch_controller.update_u0([0.0,Fb*D_VM/D_MT*np.sin(msg.pitch)])
-        self.temp_goal_log_count += 1
-        now_t = self.get_clock().now().nanoseconds/1e9
-        if now_t - self.temp_goal_log_last_t >= 0.5:
-            self.get_logger().info(
-                "[TEMP_TEST_TRACE] low_level_controller received goal "
-                f"ns={self.ns} count={self.temp_goal_log_count} "
-                f"ux={msg.ux:.3f} uz={msg.uz:.3f} wz={msg.wz:.3f}"
-            )
-            self.temp_goal_log_last_t = now_t
 
-    def motor_mixer(self,thrusts,yaw):
-        '''
-        thrusts: [fx,fy] forces in x and y direction
-        returns [m1,m2,m3,m4] thrust from each m_i motor
-        '''
-        # self.get_logger().info(f'{thrusts}')
-        B = self.rotation_matrix(yaw)@np.array(thrusts)
-        dp = np.clip(np.dot(self.u_i,B), 0, 0.9 )
-        # dp = dp / np.linalg.norm(dp)
-        # return dp
-        return dp
 
     def controller(self,msg):
         mtr = [0.0]*6
-        if self.received_goal:
+        if self.received_goal and self.fly_to_goal:
             # build measurement matrix
+            blimp_id = msg.id
             x,y,alt,roll,pitch,yaw,t = (msg.x,msg.y,msg.z,msg.roll,msg.pitch,msg.yaw,msg.time)
+            self.get_logger().info(f" Flying to goal: {self.x_goal[0]}, {self.y_goal[0]}, {self.alt_goal[0]}")
+
+            dx = self.x_goal[0] - x
+            dy = self.y_goal[0] - y
+            yaw_goal = np.arctan2(dy,-dx)
+            if yaw_goal < 0:
+                yaw_goal += 2*np.pi
+                
+            self.yaw_goal = np.array([yaw_goal,0.0])
+            self.get_logger().info(f"Yaw goal: {self.yaw_goal}, current yaw: {yaw}")
 
             self.yaws.append(yaw)
             self.pitches.append(pitch)
@@ -335,7 +229,7 @@ class ControllerNode(Node):
                     yaw_u = yaw_u/abs(yaw_u) * MAX_YAW_VOLTAGE
 
 
-                if abs((yaw-YAW_OFFSET)-self.yaw_goal[0]) < 0.2 and abs(wz) < 0.1 and self.start_cbf: # only fly forward when yaw is stable
+                if abs((yaw-YAW_OFFSET)-self.yaw_goal[0]) < 0.2 and abs(wz) < 0.1: # only fly forward when yaw is stable
                     state = np.array([0.0,pitch-PITCH_OFFSET]) #pose is 0 because goal is relative to the blimp
                     #full state is [x,theta,xdot,thetadot]
 
@@ -391,11 +285,11 @@ class ControllerNode(Node):
                 # Publish message        
                 t = self.get_clock().now().nanoseconds/1e9
 
-                msg = Float32MultiArray()
-                msg.data = list(np.array(mtr).astype(float))
-                if self.publisher is not None and self.active_agent_name:
-                    msg.data.append(float(self.active_agent_name.split('_')[-1]))
-                    self.publisher.publish(msg)
+                msg = MotorMsg()
+                msg.id = blimp_id
+                msg.com = self.com_port
+                msg.voltages = Float32MultiArray(data=list(np.array(mtr).astype(float)))
+                self.publisher.publish(msg)
 
 
 class LQR(object):

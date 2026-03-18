@@ -7,6 +7,7 @@ import re
 
 import rclpy
 from rclpy.node import Node
+from rclpy.parameter import Parameter
 from std_msgs.msg import Float32MultiArray
 import numpy as np
 from rcl_interfaces.msg import SetParametersResult
@@ -36,12 +37,14 @@ class SerialNode(Node):
         ############################################
 
 
-        self.declare_parameter('agents',['COM7','agent_61']) #This gets overwritten by launch file
+        self.declare_parameter('agents', Parameter.Type.STRING_ARRAY)
         a = self.get_parameter('agents').value
 
         self.config_lock = threading.Lock()
         self.voltage_subscribers = []
         self.mapping_dict = {}
+        self._motor_log_last = {}  # ns -> last log time
+        self._motor_log_interval = 0.5  # seconds between logs per agent
         self._configure_agents(a)
         self.add_on_set_parameters_callback(self._on_set_parameters)
 
@@ -85,6 +88,7 @@ class SerialNode(Node):
             self._destroy_all_subscriptions()
             self._close_all_serial()
 
+            opened = 0
             for i in range(0, len(agents), 2):
                 port = str(agents[i]).strip()
                 agent = str(agents[i + 1]).strip()
@@ -94,20 +98,34 @@ class SerialNode(Node):
                     self.write_motor_commands,
                     10,
                 )
-                ser = serial.Serial(
-                    port,
-                    921600,
-                    timeout=0.1,
-                    bytesize=8,
-                    parity='N',
-                    stopbits=1,
-                    write_timeout=1,
-                    xonxoff=False,
-                    rtscts=False,
-                    dsrdtr=False,
-                )
+                try:
+                    ser = serial.Serial(
+                        port,
+                        921600,
+                        timeout=0.1,
+                        bytesize=8,
+                        parity='N',
+                        stopbits=1,
+                        write_timeout=1,
+                        xonxoff=False,
+                        rtscts=False,
+                        dsrdtr=False,
+                    )
+                except serial.SerialException as exc:
+                    self.get_logger().warn(
+                        f"Skipping '{agent}' on '{port}': could not open/configure serial port ({exc})"
+                    )
+                    self.destroy_subscription(sub)
+                    continue
                 self.voltage_subscribers.append(sub)
                 self.mapping_dict[agent] = ser
+                opened += 1
+
+            if opened == 0:
+                self.get_logger().warn(
+                    "No usable serial ports were configured. "
+                    "Node will stay alive and can be updated from GUI/parameters."
+                )
 
     def _on_set_parameters(self, params):
         for param in params:
@@ -149,8 +167,22 @@ class SerialNode(Node):
         if ser is None:
             self.get_logger().warn(f"Received command for unknown namespace '{ns}'")
             return
-        ser.write(to_send)
-        ser.flush() #flush buffer, commands send instantly and we do not want buildup
+        try:
+            ser.write(to_send)
+            ser.flush()  # flush buffer, commands send instantly and we do not want buildup
+            now_t = time.monotonic()
+            last = self._motor_log_last.get(ns, 0.0)
+            if now_t - last >= self._motor_log_interval:
+                self.get_logger().info(
+                    f"Motor command {ns}: mtrs=[{pwm_1:.2f}, {pwm_2:.2f}, {pwm_3:.2f}, "
+                    f"{pwm_4:.2f}, {pwm_5:.2f}, {pwm_6:.2f}]"
+                )
+                self._motor_log_last[ns] = now_t
+        except serial.SerialException as exc:
+            self.get_logger().warn(
+                f"Serial write failed for '{ns}': {exc}. "
+                "Check cable/power and refresh mappings from GUI."
+            )
 
 
     # Telemetry read function for when sensors are used

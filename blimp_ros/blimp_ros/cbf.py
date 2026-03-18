@@ -6,6 +6,7 @@
 
 import rclpy
 from rclpy.node import Node
+from rclpy.parameter import Parameter
 from blimp_msgs.msg import GoalMsg, OptiTrackPose
 from rcl_interfaces.msg import SetParametersResult
 
@@ -25,7 +26,7 @@ class CBF(Node):
     def __init__(self):
         super().__init__('cbf_node')
 
-        self.declare_parameter('agents',['COM7','agent_61'])
+        self.declare_parameter('agents', Parameter.Type.STRING_ARRAY)
         a = self.get_parameter('agents').value
 
         self.agents = []
@@ -33,7 +34,7 @@ class CBF(Node):
         self.goals_param = []
         self.num_blimps = 0
 
-        self.declare_parameter('goals',['agent_63','agent_61'])
+        self.declare_parameter('goals', Parameter.Type.STRING_ARRAY)
         g = self.get_parameter('goals').value
         self.goal_map = {g[i]:g[i+1] for i in range(len(g)) if i%2 == 0}
 

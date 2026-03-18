@@ -9,6 +9,9 @@ blimp_sim/log
 blimp_msgs/build
 blimp_msgs/install
 blimp_msgs/log
+blimp_clean/build
+blimp_clean/install
+blimp_clean/log
 *.png
 blimp/
 __pycache__/

@@ -39,14 +39,14 @@ def generate_launch_description():
         '-NoProfile',
         '-ExecutionPolicy', 'Bypass',
         '-Command',
-        "py -3 'C:\\Scripts\\teleop_sender.py'"
+        "py -3 'C:\\Scripts\\basic_teleop_sender.py'"
     ],
         output='both',
         emulate_tty=True,
     )
 
     serial_node = Node(
-        package='blimp_ros',
+        package='blimp_clean',
         executable='serial_node',
         name='serial_node',
         output='screen',
@@ -54,82 +54,36 @@ def generate_launch_description():
     )
 
     optitrack_node = Node(
-        package='blimp_ros',
+        package='blimp_clean',
         executable='optitrack_node',  # for Python ROS nodes this is the console script name
         name='optitrack_node',
         output='screen',
         parameters = [{'agents':agents},{'goals':goal_map}]
     )
 
-    cbf_node = Node(
-        package="blimp_ros",
-        executable="cbf",
-        name="cbf",
-        output="screen",
-        parameters=[{"agents":agents,'goals':goal_map,"dmin":1.0}]
-    )
-
-    setup_gui_arg = DeclareLaunchArgument(
-        'start_setup_gui',
-        default_value='false',
-        description='Start the setup GUI node for runtime blimp configuration',
-    )
-
     setup_gui_node = Node(
-        package='blimp_ros',
+        package='blimp_clean',
         executable='setup_gui_node',
         name='setup_gui_node',
         output='screen',
-        condition=IfCondition(LaunchConfiguration('start_setup_gui')),
     )
 
     teleop_node = Node(
-        package='blimp_ros',
-        executable='teleop_node',
+        package='blimp_clean',
+        executable='teleop_receiver',
         name='teleop_node',
         output='screen',
-        parameters=[{
-            'teleop_enabled': False,
-            'target_agent': '',
-            'udp_bind_host': '0.0.0.0',
-            'udp_bind_port': 1512
-        }],
     )
+
 
     ld = LaunchDescription()
 
-    ld.add_action(setup_gui_arg)
     ld.add_action(start_windows_forwarder)
     ld.add_action(start_windows_teleop_sender)
     ld.add_action(serial_node)  
     ld.add_action(optitrack_node)  
-    ld.add_action(cbf_node)
     ld.add_action(teleop_node)
     ld.add_action(setup_gui_node)
-
-    # for a in range(len(agents)):
-    #     if a % 2 == 1:
-    #         group = GroupAction([
-    #             PushRosNamespace(f'{agents[a]}'),
-    #             Node(
-    #                 package='blimp_ros',
-    #                 executable='low_level_controller',  # for Python ROS nodes this is the console script name
-    #                 name='low_level_controller',
-    #                 output='screen',
-    #                 parameters = [{'goal':goal}]
-    #             ),
-    #             # Node(
-    #             #     package='blimp_ros',
-    #             #     executable='high_level_controller',
-    #             #     name='high_level_controller',
-    #             #     output='screen',
-    #             #     parameters = [{'goal': goal
-    #             #     }]
-
-    #             # ),
-    #         ])
-
-    #         ld.add_action(group)
 
 
     return ld

@@ -12,8 +12,10 @@
 
 import rclpy
 from rclpy.node import Node
+from rclpy.parameter import Parameter
 from blimp_msgs.msg import OptiTrackPose, GoalMsg
 from rcl_interfaces.msg import SetParametersResult
+from std_msgs.msg import Int32
 
 import threading
 import socket
@@ -25,7 +27,6 @@ import re
 
 import subprocess
 
-LOCAL_IP  = "192.168.0.102"  #Windows IP, should never change wrt Tp-Link unless different ether/wifi
 LOCAL_IP = "0.0.0.0"
 
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -39,10 +40,10 @@ class OptiTrackNode(Node):
     def __init__(self):
         super().__init__('optitrack_node')
 
-        self.declare_parameter('agents',['/dev/ttyUSB0','agent_61']) #Parameter overwritten by launch
+        self.declare_parameter('agents', Parameter.Type.STRING_ARRAY)
         self.agents = self.get_parameter('agents').value
 
-        self.declare_parameter('goals',['agent_63','agent_61'])
+        self.declare_parameter('goals', Parameter.Type.STRING_ARRAY)
         self.goals = self.get_parameter('goals').value
 
         self.publishers_created = []
@@ -50,6 +51,7 @@ class OptiTrackNode(Node):
         self.agent_set = set()
         self.goal_publishing = dict()
         self.goal_set = set()
+        self.discovered_id_pub = self.create_publisher(Int32, '/optitrack_node/discovered_id', 20)
         self._configure_mappings(self.agents, self.goals)
         self.add_on_set_parameters_callback(self._on_set_parameters)
 
@@ -100,6 +102,7 @@ class OptiTrackNode(Node):
         # list format is [port, agent, port, agent, ...]
         for i in range(1, len(self.agents), 2):
             agent = self.agents[i]
+            self.get_logger().info(f'setting {agent}')
             self.agent_set.add(agent)
             pub = self.create_publisher(OptiTrackPose, f'/{agent}/optitrack_node/pose', 5)
             self.publish_mapping[agent] = pub
@@ -155,6 +158,7 @@ class OptiTrackNode(Node):
                 f"Updated OptiTrack mappings: agents={next_agents}, goals={next_goals}"
             )
         return SetParametersResult(successful=True)
+        
     def publish_goal(self,goal_values,publisher):
         msg = GoalMsg() #Custom goal message defined in blimp_msgs/msg/GoalMsg.msg
         msg.id = int(goal_values[-1])
@@ -183,12 +187,19 @@ class OptiTrackNode(Node):
             data_entries = data.decode('utf-8',errors='replace').strip().split(',')
             if len(data_entries) > 1: #Goal publishing, only care about the x y
                 id_,x,z,y,qx,qy,qz,qw = data_entries
+                try:
+                    id_int = int(id_)
+                except ValueError:
+                    continue
+                discovered = Int32()
+                discovered.data = id_int
+                self.discovered_id_pub.publish(discovered)
                 string_id = f'agent_{id_}'
                 if string_id in self.goal_set: # if goal, publish goal
                     goal_arr = [0.0]*13
                     goal_arr[0] = x
                     goal_arr[1] = y
-                    goal_arr[-1] = int(id_)
+                    goal_arr[-1] = id_int
 
                     for pub in self.goal_publishing[string_id]:
                         self.publish_goal(np.array(goal_arr,dtype=np.float64),pub)
@@ -196,7 +207,7 @@ class OptiTrackNode(Node):
                 elif string_id in self.agent_set: #if pose, publish pose
                     roll,pitch,yaw = self.quat_to_euler(np.array([qx,qy,qz,qw]).astype(float))
                     msg = OptiTrackPose()
-                    msg.id = int(id_)
+                    msg.id = id_int
                     msg.x = float(x)
                     msg.y = float(y)
                     msg.z = float(z)
@@ -204,7 +215,7 @@ class OptiTrackNode(Node):
                     msg.yaw = float(yaw)
                     msg.pitch = float(pitch)
                     msg.time = self.get_clock().now().nanoseconds/1e9
-                    string_id = f'agent_{int(id_)}'
+                    string_id = f'agent_{id_int}'
                     self.publish_mapping[string_id].publish(msg)
 
     def quat_to_euler(self, q):

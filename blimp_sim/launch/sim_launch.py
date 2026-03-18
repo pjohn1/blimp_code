@@ -75,10 +75,10 @@ def generate_launch_description():
         parameters = params
     )
 
-    update_control = Node(
+    random_voltage_control = Node(
         package='blimp_sim',
-        executable='update_control',  # for Python ROS nodes this is the console script name
-        name='update_control',
+        executable='random_voltage_control',  # for Python ROS nodes this is the console script name
+        name='random_voltage_control',
         output='screen',
         parameters = params
     )
@@ -89,6 +89,6 @@ def generate_launch_description():
     ld.add_action(rviz2)
     ld.add_action(delay)
     ld.add_action(sim_run)
-    ld.add_action(update_control)
+    ld.add_action(random_voltage_control)
 
     return ld

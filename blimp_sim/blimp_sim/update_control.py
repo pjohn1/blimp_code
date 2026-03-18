@@ -1,6 +1,55 @@
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import Float32MultiArray
+
+import numpy as np
+
+
+class UpdateControls(Node):
+    def __init__(self):
+        super().__init__("update_states")
+        self.publisher = self.create_publisher(
+            Float32MultiArray, "/controls/control_update", 5
+        )
+        self.subscriber = self.create_subscription(
+            Float32MultiArray, "/sim/robot_pos", self.update_control, 5
+        )
+
+        self.declare_parameter("num_blimps", 2)
+        self.num_blimps = int(self.get_parameter("num_blimps").value)
+
+        self.rng = np.random.default_rng()
+
+    def update_control(self, _msg):
+        controls = []
+        for _ in range(self.num_blimps):
+            # First two motors are bidirectional vertical thrusters.
+            vertical = self.rng.uniform(-1.0, 1.0, size=2)
+            # Remaining four motors are unidirectional corner thrusters.
+            corners = self.rng.uniform(0.0, 1.0, size=4)
+            controls.extend(vertical.tolist() + corners.tolist())
+
+        out = Float32MultiArray()
+        out.data = controls
+        self.publisher.publish(out)
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    update_controls = UpdateControls()
+    try:
+        rclpy.spin(update_controls)
+    except KeyboardInterrupt:
+        pass
+    update_controls.destroy_node()
+    rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()
+import rclpy
+from rclpy.node import Node
+from std_msgs.msg import Float32MultiArray
 from nav_msgs.msg import Path
 from visualization_msgs.msg import Marker, MarkerArray
 from geometry_msgs.msg import Point
