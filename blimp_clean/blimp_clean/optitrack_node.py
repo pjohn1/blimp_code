@@ -28,9 +28,10 @@ import re
 import subprocess
 
 LOCAL_IP = "0.0.0.0"
+PORT = 1511
 
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-sock.bind((LOCAL_IP,1511))
+sock.bind((LOCAL_IP,PORT))
 sock.setblocking(True)
 
 data_lock = threading.Lock()
@@ -64,7 +65,7 @@ class OptiTrackNode(Node):
         msg.id = int(goal_values[-1])
         msg.x = goal_values[0]
         msg.y = goal_values[1]
-        msg.z = goal_values[2] + 1.0
+        msg.z = goal_values[2]
         msg.roll = goal_values[3]
         msg.pitch = goal_values[4]
         msg.yaw = goal_values[5]
