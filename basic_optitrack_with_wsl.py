@@ -45,7 +45,6 @@ def send():
 
 def receiveRigidBodyFrame(id_, position, rotation):
     global count,t0
-    print(id_)
     if len(q) < MAX_QUEUE:
         if (id_ in goals and counts[id_]%100 == 0): #if a goal, only send once every 100 updates (about 2Hz)
             q.append((id_,position,rotation)) #Manage a queue to avoid data loss

@@ -10,7 +10,8 @@ import time
 
 LOCAL_IP = "0.0.0.0"
 PORT = 1515
-MAX_VOLTAGE = 0.5
+MAX_ALT_VOLTAGE = 0.8
+MAX_VOLTAGE = 0.4
 
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 sock.bind((LOCAL_IP,PORT))
@@ -40,6 +41,8 @@ class TeleopReceiver(Node):
     def update_teleop_callback(self, msg):
         self.current_blimp = msg.id
         self.current_mode = msg.mode
+        if msg.mode==1: # Only create publisher if in controlled mode
+            self.goal_pub = self.create_publisher(GoalMsg, f'/agent_{self.current_blimp}/controller/goal_inc', 10)
         self.get_logger().info(f"Teleop: id={self.current_blimp}, mode={self.current_mode}")
 
     def socket_thread(self):
@@ -57,11 +60,11 @@ class TeleopReceiver(Node):
                 self.teleop = False
                 self.fly_to_goal_pub.publish(Bool(data=True))
 
-            if self.teleop and self.current_mode == 0 and self.current_blimp is not None: # Manual mode
+            if self.teleop and (self.current_mode == 0 or self.current_mode == 1) and self.current_blimp is not None: # Manual mode
                 voltages = [0.0] * 6
-                vertical = -lj_vert * MAX_VOLTAGE
-                yaw = rj_horizontal * MAX_VOLTAGE
-                forward = -rj_vert * MAX_VOLTAGE
+                vertical = -lj_vert/abs(lj_vert) * min(abs(lj_vert),MAX_ALT_VOLTAGE) #dirn times magnitude
+                yaw = rj_horizontal/abs(rj_horizontal) * min(abs(rj_horizontal),MAX_VOLTAGE)
+                forward = -rj_vert/abs(rj_vert) * min(abs(rj_vert),MAX_VOLTAGE)
                 voltages[2] = vertical
                 voltages[3] = -vertical
                 if yaw > 0:
@@ -76,10 +79,22 @@ class TeleopReceiver(Node):
                     voltages[0] += abs(forward)
                     voltages[1] += abs(forward)
 
-                self.motor_pub.publish(MotorMsg(id=self.current_blimp, com=self.blimps[self.current_blimp], voltages=Float32MultiArray(data=voltages)))
+                if self.current_mode == 0: # Single control
+                    self.motor_pub.publish(MotorMsg(id=self.current_blimp, com=self.blimps[self.current_blimp], voltages=Float32MultiArray(data=voltages)))
+                else: # All control
+                    for b in self.blimps:
+                        self.motor_pub.publish(MotorMsg(id=b,com=self.blimps[b],voltages=Float32MultiArray(data=voltages)))
 
-
-
+            elif self.teleop and self.current_mode == 1 and self.current_blimp is not None: # Controlled mode
+                vertical = -lj_vert/abs(lj_vert)
+                yaw = rj_horizontal/abs(rj_horizontal)
+                forward = -rj_vert/abs(rj_vert)
+                msg = GoalMsg()
+                msg.x = forward
+                msg.z = vertical
+                msg.yaw = yaw
+                self.goal_pub.publish(msg)
+                
 
 
 def main(args=None):

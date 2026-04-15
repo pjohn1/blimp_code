@@ -35,13 +35,15 @@ class SerialNode(Node):
         self.send_fmt = '<B8sddddddc'
         self.send_packet_size = struct.calcsize(self.send_fmt)
 
+        self.serials = None
         ############################################
 
         self.create_subscription(MotorMsg, '/motor_cmd', self.write_motor_commands, 10) # Teleop subscriber
         self.create_subscription(Blimps, '/blimps_initialize', self.update_blimps_callback, 10)
     
     def update_blimps_callback(self, msg):
-        for id_ in msg.ids:
+        for (id_,com) in zip(msg.ids,msg.coms):
+            self.serials[f'agent_{id_}'] = serial.Serial(com, 921600, timeout=0.1)
             self.create_subscription(MotorMsg, f'/agent_{id_}/motor_cmd', self.write_motor_commands, 10) #Controller sub
 
     def write_motor_commands(self, msg):
@@ -53,7 +55,7 @@ class SerialNode(Node):
         uid = msg.id
         com = msg.com
         voltages = msg.voltages
-        ser = serial.Serial(com, 921600, timeout=0.1)
+        ser = self.serials[f'agent_{uid}']
         msg_ = 'MOTORCTL'
         ns = f'agent_{uid}' # Blimp namespace
         mtrs =[0.0 if abs(d)<1e-6 else d/abs(d)*min(0.9,abs(round(d,2))) for d in voltages.data] #Motor voltages, clipped

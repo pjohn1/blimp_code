@@ -16,6 +16,7 @@ blimp_clean/log
 blimp/
 __pycache__/
 *.pyc
+blimp_clean/graphify-out
 
 # ROS bags
 *.mcap

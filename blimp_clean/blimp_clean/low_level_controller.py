@@ -127,6 +127,7 @@ class ControllerNode(Node):
         self.publisher = self.create_publisher(MotorMsg,'motor_cmd',5)
         self.subscriber = self.create_subscription(GoalMsg,f'controller/goal',self.update_goal,5)
         self.telemetry = self.create_subscription(OptiTrackPose,f'optitrack_node/pose',self.controller,5)
+        self.increment_goal_subscriber = self.create_subscription(GoalMsg,f'controller/goal_inc',self.increment_goal,5)
         self.fly_to_goal_subscriber = self.create_subscription(Bool, "/fly_to_goal", self.update_fly_to_goal, 5)
 
         ##### CONTROLLERS #############
@@ -150,9 +151,30 @@ class ControllerNode(Node):
         self.ts = []
 
         self.last_rates = [0.0,0.0,0.0,0.0,0.0] #vx,vy,vz,wy,wz
+        self.last_pose = None
         
     def update_fly_to_goal(self, msg):
         self.fly_to_goal = msg.data
+    
+    def increment_goal(self,msg):
+        '''
+        msg.x - forward cmd
+        msg.z - vertical cmd
+        msg.yaw = yaw cmd
+        '''
+
+        yaw = self.last_pose[5]
+        dx_world = -msg.x * np.cos(yaw)
+        dy_world = msg.x * np.sin(yaw)
+
+        self.x_goal = np.array([self.last_pose[0] + dx_world,0.0])
+        self.y_goal = np.array([self.last_pose[1] + dy_world,0.0])
+        self.alt_goal = np.array([self.last_pose[2]+msg.z,0.0])
+        self.yaw_goal = np.array([self.last_pose[5]+msg.yaw,0.0])
+        self.pitch_goal = np.array([self.last_pose[4]+msg.pitch,0.0])
+        self.received_goal = True
+        
+
 
     def update_goal(self,msg):
         self.received_goal = True
@@ -171,6 +193,7 @@ class ControllerNode(Node):
             # build measurement matrix
             blimp_id = msg.id
             x,y,alt,roll,pitch,yaw,t = (msg.x,msg.y,msg.z,msg.roll,msg.pitch,msg.yaw,msg.time)
+            self.last_pose = (x,y,alt,roll,pitch,yaw)
             self.get_logger().info(f" Flying to goal: {self.x_goal[0]}, {self.y_goal[0]}, {self.alt_goal[0]}")
 
             dx = self.x_goal[0] - x
@@ -178,7 +201,7 @@ class ControllerNode(Node):
             yaw_goal = np.arctan2(dy,-dx)
             if yaw_goal < 0:
                 yaw_goal += 2*np.pi
-                
+
             self.yaw_goal = np.array([yaw_goal,0.0])
             self.get_logger().info(f"Yaw goal: {self.yaw_goal}, current yaw: {yaw}")
 
