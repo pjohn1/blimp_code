@@ -38,11 +38,14 @@ class SerialNode(Node):
         self.serials = None
         ############################################
 
+        self.last_t = time.time()
+
         self.create_subscription(MotorMsg, '/motor_cmd', self.write_motor_commands, 10) # Teleop subscriber
         self.create_subscription(Blimps, '/blimps_initialize', self.update_blimps_callback, 10)
     
     def update_blimps_callback(self, msg):
         for (id_,com) in zip(msg.ids,msg.coms):
+            self.serials = {} if self.serials is None else self.serials
             self.serials[f'agent_{id_}'] = serial.Serial(com, 921600, timeout=0.1)
             self.create_subscription(MotorMsg, f'/agent_{id_}/motor_cmd', self.write_motor_commands, 10) #Controller sub
 
@@ -55,7 +58,13 @@ class SerialNode(Node):
         uid = msg.id
         com = msg.com
         voltages = msg.voltages
-        ser = self.serials[f'agent_{uid}']
+        if self.serials is not None:
+            ser = self.serials[f'agent_{uid}'] #After blimp setup complete
+            close = False
+        else:
+            self.get_logger().info(f"Opening serial port {com} for agent {uid}")
+            ser = serial.Serial(com,912600,timeout=0.1) #Before setup complete, when "Verify Setup" is clicked
+            close = True
         msg_ = 'MOTORCTL'
         ns = f'agent_{uid}' # Blimp namespace
         mtrs =[0.0 if abs(d)<1e-6 else d/abs(d)*min(0.9,abs(round(d,2))) for d in voltages.data] #Motor voltages, clipped
@@ -64,9 +73,12 @@ class SerialNode(Node):
         to_send = f'{uid},{msg_},{pwm_1},{pwm_2},{pwm_3},{pwm_4},{pwm_5},{pwm_6},{signal},\n' #Newline sends command
         to_send = to_send.encode('utf-8')
 
-
+        self.get_logger().info(f'Receiving commands at {round(1/(time.time()-self.last_t),2)}Hz')
+        self.last_t = time.time()
         ser.write(to_send)
         ser.flush()  # flush buffer, commands send instantly and we do not want buildup
+        if close:
+            ser.close()
 
 
     # Telemetry read function for when sensors are used

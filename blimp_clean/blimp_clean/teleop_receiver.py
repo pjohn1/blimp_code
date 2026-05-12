@@ -1,7 +1,7 @@
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import Int32, Float32MultiArray, Bool
-from blimp_msgs.msg import TeleopMode, MotorMsg, Blimps
+from blimp_msgs.msg import TeleopMode, MotorMsg, Blimps, GoalMsg
 
 import socket
 import threading
@@ -27,11 +27,15 @@ class TeleopReceiver(Node):
         self.current_blimp = None
         self.current_mode = None
         self.teleop = True
+        self.blimps = {}
+        self.prev_dpad_x = 0
+        self.prev_dpad_y = 0
         self.create_subscription(Blimps, '/blimps_initialize',self.update_blimps_callback, 10)
         self.create_subscription(TeleopMode, '/teleop_mode',self.update_teleop_callback, 10)
 
         self.motor_pub = self.create_publisher(MotorMsg, '/motor_cmd', 10)
-        self.fly_to_goal_pub = self.create_publisher(Bool, "/fly_to_goal", 5)
+        self.fly_to_goal_pub = self.create_publisher(TeleopMode, "/fly_to_goal", 5)
+        self.teleop_mode_pub = self.create_publisher(TeleopMode, "/teleop_mode", 10)
     
     def update_blimps_callback(self, msg): # Maps blimps to com ports
         self.get_logger().info(f"Blimps: {msg.ids}, {msg.coms}")
@@ -41,7 +45,7 @@ class TeleopReceiver(Node):
     def update_teleop_callback(self, msg):
         self.current_blimp = msg.id
         self.current_mode = msg.mode
-        if msg.mode==1: # Only create publisher if in controlled mode
+        if msg.mode==2: # Only create publisher if in controlled mode
             self.goal_pub = self.create_publisher(GoalMsg, f'/agent_{self.current_blimp}/controller/goal_inc', 10)
         self.get_logger().info(f"Teleop: id={self.current_blimp}, mode={self.current_mode}")
 
@@ -51,20 +55,60 @@ class TeleopReceiver(Node):
             data, addr = sock.recvfrom(65565)
             data_entries = data.decode('utf-8',errors='replace').strip().split(',')
             data_entries = [float(entry) for entry in data_entries]
-            lj_horizontal, lj_vert, rj_horizontal, rj_vert, button_a, button_b, button_x, button_y, left_bumper, right_bumper = data_entries
-            # self.get_logger().info(f"Current mode: {self.current_mode}, Current blimp: {lj_vert}")
+            lj_horizontal, lj_vert, rj_horizontal, rj_vert, button_a, button_b, button_x, button_y, left_bumper, right_bumper, dpad_x, dpad_y = data_entries
+
+            if dpad_x == 1 and self.prev_dpad_x != 1 and self.blimps:
+                ids = sorted(self.blimps.keys())
+                if self.current_blimp is None or self.current_blimp not in ids:
+                    new_id = ids[0]
+                else:
+                    new_id = ids[(ids.index(self.current_blimp) + 1) % len(ids)]
+                mode = self.current_mode if self.current_mode is not None else 0
+                tm = TeleopMode()
+                tm.id = new_id
+                tm.mode = mode
+                self.teleop_mode_pub.publish(tm)
+                self.get_logger().info(f"Switched to blimp id={new_id}")
+            self.prev_dpad_x = dpad_x
+
+            if dpad_y != 0 and self.prev_dpad_y == 0 and self.current_blimp is not None:
+                # dpad up (+1) increments mode, dpad down (-1) decrements; modes are 0=Manual, 1=All, 2=Controlled
+                step = 1 if dpad_y == 1 else -1
+                base_mode = self.current_mode if self.current_mode is not None else 0
+                new_mode = (base_mode + step) % 3
+                tm = TeleopMode()
+                tm.id = self.current_blimp
+                tm.mode = new_mode
+                self.teleop_mode_pub.publish(tm)
+                self.get_logger().info(f"Switched to mode={new_mode}")
+            self.prev_dpad_y = dpad_y
+
             if button_a == 1:
                 self.teleop = True
-                self.fly_to_goal_pub.publish(Bool(data=False))
+                targets = list(self.blimps.keys()) if self.current_mode == 1 else (
+                    [self.current_blimp] if self.current_blimp is not None else []
+                )
+                for bid in targets:
+                    msg = TeleopMode()
+                    msg.id = bid
+                    msg.mode = 0
+                    self.fly_to_goal_pub.publish(msg)
             elif button_b == 1:
                 self.teleop = False
-                self.fly_to_goal_pub.publish(Bool(data=True))
+                targets = list(self.blimps.keys()) if self.current_mode == 1 else (
+                    [self.current_blimp] if self.current_blimp is not None else []
+                )
+                for bid in targets:
+                    msg = TeleopMode()
+                    msg.id = bid
+                    msg.mode = 1
+                    self.fly_to_goal_pub.publish(msg)
 
             if self.teleop and (self.current_mode == 0 or self.current_mode == 1) and self.current_blimp is not None: # Manual mode
                 voltages = [0.0] * 6
-                vertical = -lj_vert/abs(lj_vert) * min(abs(lj_vert),MAX_ALT_VOLTAGE) #dirn times magnitude
-                yaw = rj_horizontal/abs(rj_horizontal) * min(abs(rj_horizontal),MAX_VOLTAGE)
-                forward = -rj_vert/abs(rj_vert) * min(abs(rj_vert),MAX_VOLTAGE)
+                vertical = -lj_vert/abs(lj_vert+1e-6) * min(abs(lj_vert),MAX_ALT_VOLTAGE) #dirn times magnitude
+                yaw = rj_horizontal/abs(rj_horizontal+1e-6) * min(abs(rj_horizontal),MAX_VOLTAGE)
+                forward = -rj_vert/abs(rj_vert+1e-6) * min(abs(rj_vert),MAX_VOLTAGE)
                 voltages[2] = vertical
                 voltages[3] = -vertical
                 if yaw > 0:
@@ -85,10 +129,10 @@ class TeleopReceiver(Node):
                     for b in self.blimps:
                         self.motor_pub.publish(MotorMsg(id=b,com=self.blimps[b],voltages=Float32MultiArray(data=voltages)))
 
-            elif self.teleop and self.current_mode == 1 and self.current_blimp is not None: # Controlled mode
-                vertical = -lj_vert/abs(lj_vert)
-                yaw = rj_horizontal/abs(rj_horizontal)
-                forward = -rj_vert/abs(rj_vert)
+            elif self.teleop and self.current_mode == 2 and self.current_blimp is not None: # Controlled mode
+                vertical = -lj_vert/abs(lj_vert+1e-6)
+                yaw = rj_horizontal/abs(rj_horizontal+1e-6)
+                forward = -rj_vert/abs(rj_vert+1e-6)
                 msg = GoalMsg()
                 msg.x = forward
                 msg.z = vertical

@@ -43,8 +43,9 @@ def start_receiving():
         if joystick:
             axes = [clip_cmd(joystick.get_axis(i)) for i in range(joystick.get_numaxes())]
             buttons = [joystick.get_button(i) for i in range(joystick.get_numbuttons())]
+            hat = joystick.get_hat(0) if joystick.get_numhats() > 0 else (0, 0)
             if len(q) < MAX_QUEUE:
-                q.append((axes,buttons))
+                q.append((axes,buttons,hat))
         time.sleep(0.01)
 
 '''
@@ -70,8 +71,8 @@ def send():
     try:
         while sending:
             if len(q) > 0:
-                axes,buttons = q.popleft()
-                to_send = f"{axes[0]},{axes[1]},{axes[2]},{axes[3]},{buttons[0]},{buttons[1]},{buttons[2]},{buttons[3]},{buttons[4]},{buttons[5]}\n"
+                axes,buttons,hat = q.popleft()
+                to_send = f"{axes[0]},{axes[1]},{axes[2]},{axes[3]},{buttons[0]},{buttons[1]},{buttons[2]},{buttons[3]},{buttons[4]},{buttons[5]},{hat[0]},{hat[1]}\n"
                 to_send = to_send.encode("utf-8") #Encode to bytestring
                 sock.sendto(to_send, (WSL_IP, TARGET_PORT))
 

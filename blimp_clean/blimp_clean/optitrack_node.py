@@ -53,11 +53,18 @@ class OptiTrackNode(Node):
 
     def blimps_initialize_callback(self, msg):
         with self.data_lock:
-            ids, goals = [int(id_) for id_ in msg.ids], [int(goal) for goal in msg.goals]
-            for id_, goal in zip(ids,goals):
-                self.goal_to_agent[goal] = id_
-                self.goal_publisher_map[id_] = self.create_publisher(GoalMsg, f'/agent_{id_}/controller/goal', 5)
+            ids = [int(id_) for id_ in msg.ids if id_ != '']
+            goals = [int(goal) for goal in msg.goals if goal != '']
+            self.get_logger().info(f"Blimps initialize: {ids}, {goals}")
+            for id_ in ids:
                 self.publisher_map[id_] = self.create_publisher(OptiTrackPose, f'/agent_{id_}/optitrack_node/pose', 5)
+                self.goal_publisher_map[id_] = self.create_publisher(GoalMsg, f'/agent_{id_}/controller/goal', 5)
+            # One goal marker may be shared by multiple blimps, so map goal_id -> [agent_ids]
+            self.goal_to_agent = {}
+            for (id_, goal) in zip(ids, goals):
+                self.goal_to_agent.setdefault(goal, []).append(id_)
+    
+        
             self.maps_init = True
 
     def publish_goal(self,goal_values,publisher):
@@ -99,14 +106,7 @@ class OptiTrackNode(Node):
                 self.discovered_id_pub.publish(discovered)
                 #
 
-                if id_int in self.goal_to_agent and self.maps_init: # if goal, publish goal
-                    goal_arr = [0.0]*13
-                    goal_arr[0] = x
-                    goal_arr[1] = y
-                    goal_arr[-1] = id_int
-                    self.publish_goal(np.array(goal_arr,dtype=np.float64),self.goal_publisher_map[self.goal_to_agent[id_int]])
-
-                elif id_int in self.publisher_map and self.maps_init: #if pose, publish pose
+                if id_int in self.publisher_map and self.maps_init: #if pose, publish pose
                     roll,pitch,yaw = self.quat_to_euler(np.array([qx,qy,qz,qw]).astype(float))
                     msg = OptiTrackPose()
                     msg.id = id_int
@@ -118,6 +118,15 @@ class OptiTrackNode(Node):
                     msg.pitch = float(pitch)
                     msg.time = self.get_clock().now().nanoseconds/1e9
                     self.publisher_map[id_int].publish(msg)
+
+                if id_int in self.goal_to_agent and self.maps_init: # if goal, publish to all agents that use this marker
+                    goal_arr = [0.0]*13
+                    goal_arr[0] = x
+                    goal_arr[1] = y
+                    goal_arr[-1] = id_int
+                    goal_msg = np.array(goal_arr, dtype=np.float64)
+                    for agent_id in self.goal_to_agent[id_int]:
+                        self.publish_goal(goal_msg, self.goal_publisher_map[agent_id])
 
     def quat_to_euler(self, q):
         # assume quaternion normalized (or normalize here)

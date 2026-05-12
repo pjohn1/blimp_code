@@ -21,3 +21,6 @@ blimp_clean/graphify-out
 # ROS bags
 *.mcap
 rosbag2_*/
+
+agent_0
+blimp_clean/agent_*

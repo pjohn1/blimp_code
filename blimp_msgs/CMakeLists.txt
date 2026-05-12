@@ -16,6 +16,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/MotorMsg.msg"
   "msg/Blimps.msg"
   "msg/TeleopMode.msg"
+  "msg/GainsMsg.msg"
   DEPENDENCIES std_msgs
 )
 

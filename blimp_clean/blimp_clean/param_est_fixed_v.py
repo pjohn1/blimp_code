@@ -33,11 +33,12 @@ g = 9.81
 # 50 cm tall
 # 91.44 cm across
 
-V_guess = 0.0508
+# V is now treated as a known constant (not estimated). State is [z, zdot, Kv, Cd].
+V = 0.0508
 Kv_guess = 0.714
 Cd_guess = 0.0100
 
-# V_guess = 0.05534
+# V = 0.05534
 # Kv_guess = 0.004782
 # Cd_guess = 0.01108
 
@@ -53,40 +54,32 @@ class Model(object):
 
         '''
         self.d0 = d0
-        self.m = M_chassis + RHO_HE*V_guess + M_AZ
-        self.m_RB = self.m - M_AZ
-    
-    def get_FG(self,X, d, dt, d0):
-        
-        z, zdot, V, Kv, Cd = X
-
-        # Update mass estimates
         self.m = M_chassis + RHO_HE*V + M_AZ
         self.m_RB = self.m - M_AZ
 
+    def get_FG(self,X, d, dt, d0):
+
+        z, zdot, Kv, Cd = X
+
         u = d
 
-        # Derivative w.r.t volume (parameter is on LHS and RHS, quotient rule)
-        N = (RHO_AIR - RHO_HE)*g*V - M_chassis*g + 2*Kv*(u - d0) - Cd*zdot # RHS
-        dN_dV = (RHO_AIR - 2*RHO_HE)*g #Derviative wrt RHS
-        dm_dV = RHO_HE # Derivative w.r.t mass
-        dV = (dN_dV*self.m - N*dm_dV) / self.m**2 #Quotient rule
-
-        # Make F and G
+        # Make F and G. State order: [z, zdot, Kv, Cd].
+        # Dynamics: m*v_dot = (RHO_AIR-RHO_HE)*g*V - M_chassis*g + 2*Kv*(u-d0) - Cd*zdot
+        # so dv_next/dKv = 2*(u-d0)*dt/m and dv_next/dCd = -zdot*dt/m.
         F = np.array([
-            [1, dt, 0, 0, 0],
-            [0, 1 - 1/self.m * Cd * dt, dV*dt, 2/self.m*(u-d0)*dt, -zdot/self.m*dt],
-            [0, 0, 1, 0, 0],
-            [0, 0, 0, 1, 0],
-            [0, 0, 0, 0, 1]
+            [1, dt, 0, 0],
+            [0, 1 - 1/self.m * Cd * dt, 2/self.m*(u-d0)*dt, -zdot/self.m*dt],
+            [0, 0, 1, 0],
+            [0, 0, 0, 1],
         ])
 
+        # G maps thrust-voltage process noise into the state. Thrust enters as 2*Kv*u,
+        # so the velocity row gets 2*Kv*dt/m, matching the F entry.
         G = np.array([
             [0],
-            [1/self.m*Kv*dt],
+            [2/self.m*Kv*dt],
             [0],
             [0],
-            [0]
         ])
 
         return F, G
@@ -103,7 +96,7 @@ class ParamEstimation(Node):
         self.motor_pub = self.create_publisher(MotorMsg,f'motor_cmd',5) #Goal publisher to control testing mode
         self.covar_pub = self.create_publisher(Float32MultiArray, f'covariance',5) # These update the graphs in the GUI
         self.pred_pub = self.create_publisher(Float32MultiArray, f'state_est',5)
-        
+
         # Initializers
         self.run_calibration = False
         self.finished_calibration = False
@@ -118,7 +111,7 @@ class ParamEstimation(Node):
 
         self.count_measurements = 0
 
-        self.X = [0.0,0.0,V_guess, Kv_guess, Cd_guess] # Tracks the current position and parameters
+        self.X = [0.0, 0.0, Kv_guess, Cd_guess] # Tracks the current position and parameters
         self.model = Model()
 
         #Initialize controller
@@ -142,21 +135,25 @@ class ParamEstimation(Node):
         self.last_P = None
 
         self.init_params()
-    
+
     def init_params(self):
         if self.measure_v:
             self.H = np.array([
-                [1, 0, 0, 0, 0],
-                [0, 1, 0, 0, 0]
+                [1, 0, 0, 0],
+                [0, 1, 0, 0]
             ])
 
             self.R = np.diag([0.001**2,0.075**2]) # Uncertainty in measurements
         else:
-            self.H = np.array([[1,0,0,0,0]])
+            self.H = np.array([[1, 0, 0, 0]])
             self.R = np.array([[0.001**2]])
 
-        self.Q = np.eye(1)*0.1**2 # Uncertainty in model
-        self.P = P = np.diag([0.1**2, 0.5**2, 0.05**2, 1.0**2, 0.2**2]) # Uncertainty in estimate
+        # Thrust process noise (enters via G into the velocity row)
+        self.Q = np.eye(1)*0.1**2
+        # Parameter random walk so the EKF stays alive on Kv, Cd. Without this,
+        # P[Kv,Kv] and P[Cd,Cd] only ever shrink and the filter freezes before convergence.
+        self.Q_param = np.diag([0.0, 0.0, 1e-6, 1e-8])
+        self.P = np.diag([0.1**2, 0.5**2, 0.2**2, 0.1**2]) # Uncertainty in estimate (z, zdot, Kv, Cd)
 
 
 
@@ -196,7 +193,7 @@ class ParamEstimation(Node):
                         if run_ekf:
 
                             Xk = np.array(self.X.copy())
-                            x, xdot, V, Kv, Cd = Xk
+                            x, xdot, Kv, Cd = Xk
 
                             # Predict
                             Xnext = Xk.copy()
@@ -204,7 +201,6 @@ class ParamEstimation(Node):
                             Xnext[1] =  1/self.model.m * ( (RHO_AIR-RHO_HE)*g*V - self.model.m_RB*g + 2*Kv*u - Cd*Xk[1] ) # acceleration
                             Xnext[2] = 0 # parameters are constant
                             Xnext[3] = 0
-                            Xnext[4] = 0
 
                             Xp = Xk + dt*Xnext # Predicted state
                             F, G = self.model.get_FG(Xp, u, dt,self.d0)
@@ -230,11 +226,10 @@ class ParamEstimation(Node):
 
                                 #Update
                                 self.X = Xp + K @ nu
-                                self.P = (np.eye(5) - K@self.H)@Pp@(np.eye(5)-K@self.H).T + K@self.R@K.T
+                                self.P = (np.eye(4) - K@self.H)@Pp@(np.eye(4)-K@self.H).T + K@self.R@K.T
 
                                 self.X[2] = max(1e-6, self.X[2])
                                 self.X[3] = max(1e-6, self.X[3])
-                                self.X[4] = max(1e-6, self.X[4])
 
                                 self.state_estimates.append(self.X)
                                 self.covariance_estimates.append(self.P)
@@ -252,10 +247,10 @@ class ParamEstimation(Node):
 
                                     self.get_logger().info(f'Mean innovation: {mean_inn}, Autocorrelation: {autocorr}')
 
-                                    if abs(mean_inn) < 1e-6 and abs(autocorr) < 0.05:
+                                    if abs(mean_inn) < 1e-3 and abs(autocorr) < 0.05:
                                         self.finished_calibration = True
                                         self.finished_time = msg.time
-                                        self.get_logger().info(f'Estimated V: {self.X[2]}, Kv: {self.X[3]}, Cd: {self.X[4]}')                        
+                                        self.get_logger().info(f'Estimated Kv: {self.X[2]}, Cd: {self.X[3]}')                        
 
                                         for i in range(10):
                                             cmd = MotorMsg()
@@ -294,6 +289,9 @@ class ParamEstimation(Node):
         self.last_time = msg.time
         self.last_z = msg.z
 
+        self.last_time = msg.time
+        self.last_z = msg.z
+
 
 class MPC(object):
     '''
@@ -308,7 +306,7 @@ class MPC(object):
         dt = 1/(100/node.N_avg)
         # Ad, Bd, _, _, _ = \
         #             cont2discrete((A, B, np.eye(A.shape[0]), np.zeros((A.shape[0], B.shape[1]))), dt, method='zoh')
-        m = M_chassis + RHO_HE*V_guess + M_AZ
+        m = M_chassis + RHO_HE*V + M_AZ
         m_RB = m - M_AZ
 
         A = np.array([
@@ -320,7 +318,7 @@ class MPC(object):
             [dt/m]
         ])
 
-        Fb = (RHO_AIR-RHO_HE)*g*V_guess
+        Fb = (RHO_AIR-RHO_HE)*g*V
         self.node.get_logger().info(f'Estimated net buoyancy force: {Fb}')
         u0 = M_chassis*g - Fb
         self.node.get_logger().info(f'Diff between gravity and buoyancy: {u0}')
@@ -360,69 +358,3 @@ class MPC(object):
         u = thrust/Kv_guess
 
         return u/abs(u)*min(abs(u),MAX_VOLTAGE)
-
-class LQR(object):
-    def __init__(self):
-        self.Q = np.diag([10.0,5.0])
-        self.R = np.array([[100.0]])
-        # self.desired_poles = (-1.5, -1.33)
-    
-    def get_AB(self, X, dt, m):
-        z, zdot, V, Kv, Cd = X
-
-        A = np.array([
-            [1, dt],
-            [0, 1 - Cd/m*dt]
-        ])
-        B = np.array([
-            [0],
-            [dt/m]
-        ])
-
-        return A,B
-
-    def pole_placement(self, X, dt, d0):
-        z, zdot, *_ = X
-        Xi = [z,zdot,V_guess,Kv_guess,Cd_guess]
-
-        m = M_chassis + RHO_HE*V_guess + M_AZ
-        m_RB = m - M_AZ
-
-        Xc = np.array(X[:2]).reshape((2,1))
-        goal = np.array([[1.0],[0.0]])
-
-        Fb = (RHO_AIR-RHO_HE)*g*V_guess
-        u0 = m_RB*g - Fb
-
-        A, B = self.get_AB(Xi, dt, m)
-
-        K = place_poles(A,B,self.desired_poles).gain_matrix
-
-        thrust = u0 - K@(Xc - goal)
-        d = d0 + thrust/Kv
-        
-        return d/abs(d)*min(abs(d),MAX_VOLTAGE)
-
-    def get_control(self, X, dt, d0):
-        z, zdot, V, Kv, Cd = X
-        V = 0.0514 
-        Kv = 0.714
-        Dz = 0.0480
-
-        m = M_chassis + RHO_HE*V + M_AZ
-        m_RB = m - M_AZ
-
-        Xc = np.array(X[:2]).reshape((2,1))
-
-        goal = np.array([[1.5],[0.0]])
-
-        Fb = (RHO_AIR-RHO_HE)*g*V
-        A, B = self.get_AB(X, dt, m)
-        u0 = m_RB*g - Fb
-
-        P = solve_discrete_are(A,B,self.Q,self.R)
-        K = np.linalg.inv(B.T @ P @ B + self.R) @ (B.T @ P @ A)
-        thrust = u0 - K@(Xc - goal)
-        d = d0 + thrust/Kv
-        
-        return d/abs(d)*min(abs(d),MAX_VOLTAGE)

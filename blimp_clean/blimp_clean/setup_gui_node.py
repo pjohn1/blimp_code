@@ -10,20 +10,26 @@ import json
 import shutil
 import sys
 import threading
+from collections import deque
 from glob import glob
 from pathlib import Path
 
+import numpy as np
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Int32, Float32MultiArray
+from std_msgs.msg import Bool, Int32, Float32MultiArray
 from blimp_msgs.msg import MotorMsg, Blimps, TeleopMode, OptiTrackPose
 from blimp_clean.agent_manager import AgentManager
 
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg
+from matplotlib.figure import Figure
+
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtWidgets import (
-    QApplication, QComboBox, QFileDialog, QHBoxLayout, QHeaderView,
-    QInputDialog, QLineEdit, QMainWindow, QPushButton, QTabWidget,
-    QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
+    QApplication, QComboBox, QFileDialog,
+    QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit,
+    QMainWindow, QPushButton, QTabWidget, QTableWidget,
+    QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
 SETUPS_DIR = Path.home() / ".blimp_setups"
@@ -48,14 +54,36 @@ class SetupGuiNode(Node):
         self.blimps_pub = self.create_publisher(Blimps, "/blimps_initialize", 10)
         self.teleop_mode_pub = self.create_publisher(TeleopMode, "/teleop_mode", 10)
 
+        # Track externally-published teleop state (e.g. from teleop_receiver dpad cycle)
+        self.teleop_lock = threading.Lock()
+        self.latest_teleop = None   # (id, mode)
+        self.create_subscription(TeleopMode, "/teleop_mode", self._on_teleop_mode, 10)
+
         # Pose tracking
         self.pose_lock = threading.Lock()
         self.latest_poses = {}   # id -> OptiTrackPose
+        self.latest_dts = {}     # id -> float, seconds between last two messages
         self.pose_subs = {}      # id -> subscription
+
+        # Calibration / param estimation tracking
+        self.calib_lock = threading.Lock()
+        self.latest_state_est = {}   # id -> list[5]
+        self.latest_covariance = {}  # id -> list[25]
+        self.calib_state_subs = {}
+        self.calib_covar_subs = {}
+        self.calib_pubs = {}         # id -> publisher(Bool)
 
     def _on_discovered_id(self, msg: Int32):
         with self.id_lock:
             self.discovered_ids.add(int(msg.data))
+
+    def _on_teleop_mode(self, msg: TeleopMode):
+        with self.teleop_lock:
+            self.latest_teleop = (int(msg.id), int(msg.mode))
+
+    def get_latest_teleop(self):
+        with self.teleop_lock:
+            return self.latest_teleop
 
     def get_discovered_ids(self):
         with self.id_lock:
@@ -83,6 +111,7 @@ class SetupGuiNode(Node):
         self.pose_subs.clear()
         with self.pose_lock:
             self.latest_poses.clear()
+            self.latest_dts.clear()
 
         for aid in agent_ids:
             topic = f"/agent_{aid}/optitrack_node/pose"
@@ -93,11 +122,59 @@ class SetupGuiNode(Node):
 
     def _on_pose(self, agent_id, msg):
         with self.pose_lock:
+            prev = self.latest_poses.get(agent_id)
+            if prev is not None:
+                self.latest_dts[agent_id] = float(msg.time - prev.time)
             self.latest_poses[agent_id] = msg
 
     def get_latest_poses(self):
         with self.pose_lock:
-            return dict(self.latest_poses)
+            return dict(self.latest_poses), dict(self.latest_dts)
+
+    def setup_calibration_topics(self, ids):
+        for sub in self.calib_state_subs.values():
+            self.destroy_subscription(sub)
+        for sub in self.calib_covar_subs.values():
+            self.destroy_subscription(sub)
+        for pub in self.calib_pubs.values():
+            self.destroy_publisher(pub)
+        self.calib_state_subs.clear()
+        self.calib_covar_subs.clear()
+        self.calib_pubs.clear()
+        with self.calib_lock:
+            self.latest_state_est.clear()
+            self.latest_covariance.clear()
+
+        for aid in ids:
+            self.calib_state_subs[aid] = self.create_subscription(
+                Float32MultiArray, f"/agent_{aid}/state_est",
+                lambda msg, a=aid: self._on_state_est(a, msg), 10,
+            )
+            self.calib_covar_subs[aid] = self.create_subscription(
+                Float32MultiArray, f"/agent_{aid}/covariance",
+                lambda msg, a=aid: self._on_covariance(a, msg), 10,
+            )
+            self.calib_pubs[aid] = self.create_publisher(Bool, f"/agent_{aid}/start_calibration", 10)
+
+    def _on_state_est(self, agent_id, msg):
+        with self.calib_lock:
+            self.latest_state_est[agent_id] = list(msg.data)
+
+    def _on_covariance(self, agent_id, msg):
+        with self.calib_lock:
+            self.latest_covariance[agent_id] = list(msg.data)
+
+    def get_latest_calib_data(self):
+        with self.calib_lock:
+            return dict(self.latest_state_est), dict(self.latest_covariance)
+
+    def publish_start_calibration(self, blimp_id, active=True):
+        msg = Bool(data=active)
+        if blimp_id == -1:
+            for pub in self.calib_pubs.values():
+                pub.publish(msg)
+        elif blimp_id in self.calib_pubs:
+            self.calib_pubs[blimp_id].publish(msg)
 
     def publish_blimps(self, ids, coms, goals):
         msg = Blimps()
@@ -114,7 +191,7 @@ class SetupGuiWindow(QMainWindow):
         self.ros_node = ros_node
         self.agent_manager = AgentManager()
         self.setWindowTitle("Blimp Setup")
-        self.resize(600, 300)
+        self.resize(1200, 600)
         self.verify_timers = {}  # row -> QTimer
         self.manual_rows = set()  # row indices added manually (no OptiTrack)
 
@@ -122,6 +199,7 @@ class SetupGuiWindow(QMainWindow):
         tabs.addTab(self._build_setup_tab(), "Setup")
         tabs.addTab(self._build_teleop_tab(), "Teleop")
         tabs.addTab(self._build_telemetry_tab(), "Telemetry")
+        tabs.addTab(self._build_calibration_tab(), "Calibration")
         self.setCentralWidget(tabs)
 
         # Refresh dropdowns every 500ms
@@ -220,9 +298,9 @@ class SetupGuiWindow(QMainWindow):
         tab = QWidget()
         layout = QVBoxLayout(tab)
 
-        self.telemetry_table = QTableWidget(0, 8)
+        self.telemetry_table = QTableWidget(0, 9)
         self.telemetry_table.setHorizontalHeaderLabels(
-            ["ID", "X", "Y", "Z", "Roll", "Pitch", "Yaw", "Time"]
+            ["ID", "X", "Y", "Z", "Roll", "Pitch", "Yaw", "Time", "dt (Hz)"]
         )
         self.telemetry_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.telemetry_table.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -231,16 +309,18 @@ class SetupGuiWindow(QMainWindow):
         return tab
 
     def _refresh_telemetry(self):
-        poses = self.ros_node.get_latest_poses()
+        poses, dts = self.ros_node.get_latest_poses()
         agent_ids = sorted(poses.keys())
         self.telemetry_table.setRowCount(len(agent_ids))
         for row, aid in enumerate(agent_ids):
             p = poses[aid]
+            dt = dts.get(aid)
             values = [
                 str(aid),
                 f"{p.x:.3f}", f"{p.y:.3f}", f"{p.z:.3f}",
                 f"{p.roll:.3f}", f"{p.pitch:.3f}", f"{p.yaw:.3f}",
                 f"{p.time:.2f}",
+                f"{1/(dt+1e-12):.1f}" if dt is not None else "-",
             ]
             for col, val in enumerate(values):
                 item = self.telemetry_table.item(row, col)
@@ -251,6 +331,135 @@ class SetupGuiWindow(QMainWindow):
                 else:
                     item.setText(val)
 
+    def _build_calibration_tab(self):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+
+        ctrl_row = QHBoxLayout()
+        ctrl_row.addWidget(QLabel("Blimp:"))
+        self.calib_blimp_combo = QComboBox()
+        self.calib_blimp_combo.setEditable(False)
+        self.calib_blimp_combo.addItem("All")
+        ctrl_row.addWidget(self.calib_blimp_combo)
+        start_btn = QPushButton("Start Calibration")
+        start_btn.clicked.connect(self._start_calibration)
+        ctrl_row.addWidget(start_btn)
+        stop_btn = QPushButton("Stop Calibration")
+        stop_btn.clicked.connect(self._stop_calibration)
+        ctrl_row.addWidget(stop_btn)
+        ctrl_row.addStretch()
+        layout.addLayout(ctrl_row)
+
+        self._calib_fig = Figure(figsize=(8, 8), tight_layout=True)
+        self._calib_canvas = FigureCanvasQTAgg(self._calib_fig)
+        self._calib_axes = self._calib_fig.subplots(5, 1, sharex=True)
+        _STATE_LABELS = ["z (m)", "ż (m/s)", "V (m³)", "Kv", "Cd"]
+        for ax, label in zip(self._calib_axes, _STATE_LABELS):
+            ax.set_ylabel(label)
+            ax.grid(True)
+        self._calib_axes[-1].set_xlabel("Sample")
+        layout.addWidget(self._calib_canvas)
+
+        # Rolling history per blimp: id -> {'state', 'sigma', 'n_state'} (n_state 4 or 5)
+        self._calib_history = {}
+
+        self.calib_plot_timer = QTimer(self)
+        self.calib_plot_timer.timeout.connect(self._refresh_calibration_plot)
+        self.calib_plot_timer.start(100)
+
+        return tab
+
+    def _start_calibration(self):
+        text = self.calib_blimp_combo.currentText().strip()
+        blimp_id = -1 if (not text or text == "All") else int(text)
+        self.ros_node.publish_start_calibration(blimp_id, active=True)
+
+    def _stop_calibration(self):
+        text = self.calib_blimp_combo.currentText().strip()
+        blimp_id = -1 if (not text or text == "All") else int(text)
+        self.ros_node.publish_start_calibration(blimp_id, active=False)
+
+    def _refresh_calibration_plot(self):
+        state_data, covar_data = self.ros_node.get_latest_calib_data()
+
+        for aid, state in state_data.items():
+            n = len(state)
+            if n not in (4, 5):
+                continue
+            covar = covar_data.get(aid, [])
+            if n == 5 and len(covar) >= 25:
+                sigma = [np.sqrt(max(covar[i * 5 + i], 0.0)) for i in range(5)]
+            elif n == 4 and len(covar) >= 16:
+                sigma = [np.sqrt(max(covar[i * 4 + i], 0.0)) for i in range(4)]
+            else:
+                sigma = [0.0] * n
+            if aid not in self._calib_history:
+                self._calib_history[aid] = {
+                    'state': deque(maxlen=200),
+                    'sigma': deque(maxlen=200),
+                    'n_state': n,
+                }
+            else:
+                entry = self._calib_history[aid]
+                if entry['n_state'] != n:
+                    entry['state'].clear()
+                    entry['sigma'].clear()
+                    entry['n_state'] = n
+            self._calib_history[aid]['state'].append(list(state[:n]))
+            self._calib_history[aid]['sigma'].append(sigma)
+
+        if not self._calib_history:
+            return
+
+        for ax in self._calib_axes:
+            ax.cla()
+            ax.grid(True)
+
+        def _hist_n_state(h):
+            if h['state']:
+                return len(h['state'][-1])
+            return h.get('n_state', 5)
+
+        show_v = any(
+            h['state'] and len(h['state'][-1]) == 5
+            for h in self._calib_history.values()
+        )
+        self._calib_axes[2].set_visible(show_v)
+
+        _STATE_LABELS = ["z (m)", "ż (m/s)", "V (m³)", "Kv", "Cd"]
+        for ax, label in zip(self._calib_axes, _STATE_LABELS):
+            ax.set_ylabel(label)
+
+        # 4-state layout: [z, ż, Kv, Cd] -> subplot rows 0,1,3,4 (skip V)
+        _PLOT_ROWS_4 = ((0, 0), (1, 1), (2, 3), (3, 4))
+
+        for aid, hist in self._calib_history.items():
+            if not hist['state']:
+                continue
+            n = _hist_n_state(hist)
+            states = np.array(hist['state'])
+            sigmas = np.array(hist['sigma'])
+            xs = np.arange(len(states))
+            if n == 5:
+                rows = [(i, i) for i in range(5)]
+            else:
+                rows = _PLOT_ROWS_4
+            for si, ri in rows:
+                ax = self._calib_axes[ri]
+                ax.plot(xs, states[:, si], label=f"blimp {aid}")
+                ax.fill_between(
+                    xs,
+                    states[:, si] - 2 * sigmas[:, si],
+                    states[:, si] + 2 * sigmas[:, si],
+                    alpha=0.25,
+                )
+
+        if len(self._calib_history) > 1:
+            self._calib_axes[0].legend(fontsize=7, loc="upper right")
+
+        self._calib_axes[-1].set_xlabel("Sample")
+        self._calib_canvas.draw_idle()
+
     # -- combo helpers --
 
     def _make_combo(self, options):
@@ -258,6 +467,12 @@ class SetupGuiWindow(QMainWindow):
         combo.setEditable(False)
         combo.addItem("")
         combo.addItems(options)
+        # Track when the user explicitly selects the empty slot so _refresh_options
+        # doesn't override that choice.  Signals are blocked during _update_combo,
+        # so only real user interactions (or unblocked programmatic sets) reach here.
+        combo.currentIndexChanged.connect(
+            lambda idx, c=combo: setattr(c, "_user_cleared", idx == 0)
+        )
         return combo
 
     def _update_combo(self, combo, options):
@@ -343,19 +558,46 @@ class SetupGuiWindow(QMainWindow):
             id_combo = self.table.cellWidget(row, 0)
             port_combo = self.table.cellWidget(row, 1)
             goal_combo = self.table.cellWidget(row, 2)
-            if not id_combo.currentText() and optitrack_idx < len(assigned_ids):
+            if (not id_combo.currentText()
+                    and not getattr(id_combo, "_user_cleared", False)
+                    and optitrack_idx < len(assigned_ids)):
                 idx = id_combo.findText(assigned_ids[optitrack_idx])
                 if idx >= 0:
                     id_combo.setCurrentIndex(idx)
-            if not port_combo.currentText() and optitrack_idx < len(ports):
+            if (not port_combo.currentText()
+                    and not getattr(port_combo, "_user_cleared", False)
+                    and optitrack_idx < len(ports)):
                 idx = port_combo.findText(ports[optitrack_idx])
                 if idx >= 0:
                     port_combo.setCurrentIndex(idx)
-            if not goal_combo.currentText() and optitrack_idx < len(leftover_ids):
+            if (not goal_combo.currentText()
+                    and not getattr(goal_combo, "_user_cleared", False)
+                    and optitrack_idx < len(leftover_ids)):
                 idx = goal_combo.findText(leftover_ids[optitrack_idx])
                 if idx >= 0:
                     goal_combo.setCurrentIndex(idx)
             optitrack_idx += 1
+
+        self._sync_teleop_combos()
+
+    def _sync_teleop_combos(self):
+        latest = self.ros_node.get_latest_teleop()
+        if latest is None:
+            return
+        blimp_id, mode = latest
+        id_str = str(blimp_id)
+        idx = self.teleop_blimp_combo.findText(id_str)
+        if idx >= 0 and self.teleop_blimp_combo.currentIndex() != idx:
+            self.teleop_blimp_combo.blockSignals(True)
+            self.teleop_blimp_combo.setCurrentIndex(idx)
+            self.teleop_blimp_combo.blockSignals(False)
+        mode_text = next((k for k, v in self.mode_map.items() if v == mode), None)
+        if mode_text is not None:
+            m_idx = self.teleop_mode_combo.findText(mode_text)
+            if m_idx >= 0 and self.teleop_mode_combo.currentIndex() != m_idx:
+                self.teleop_mode_combo.blockSignals(True)
+                self.teleop_mode_combo.setCurrentIndex(m_idx)
+                self.teleop_mode_combo.blockSignals(False)
 
     # -- save / load setup --
 
@@ -490,6 +732,15 @@ class SetupGuiWindow(QMainWindow):
         if id_strs:
             self.teleop_blimp_combo.setCurrentIndex(0)
         self.teleop_blimp_combo.blockSignals(False)
+
+        # Populate calibration dropdown: "All" + each id, and (re)subscribe to calib topics
+        self.calib_blimp_combo.blockSignals(True)
+        self.calib_blimp_combo.clear()
+        self.calib_blimp_combo.addItem("All")
+        self.calib_blimp_combo.addItems(id_strs)
+        self.calib_blimp_combo.blockSignals(False)
+        self.ros_node.setup_calibration_topics(ids)
+        self._calib_history.clear()
 
     # -- verify setup --
 

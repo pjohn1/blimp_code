@@ -2,7 +2,7 @@
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import Float32MultiArray, Int32, Bool
-from blimp_msgs.msg import OptiTrackPose, GoalMsg, MotorMsg
+from blimp_msgs.msg import OptiTrackPose, GoalMsg, MotorMsg, TeleopMode
 from rcl_interfaces.msg import SetParametersResult
 
 import numpy as np
@@ -12,20 +12,33 @@ from scipy.signal import cont2discrete
 
 import tinympc
 import time
+import threading
 
 ## BLIMP PROPERTIES ##################
 # https://doi.org/10.1142/S2301385021500060?urlappend=%3Futm_source%3Dresearchgate.net%26medium%3Darticle
+# Geometry properties were measured, mass properties assumed
+
+RHO_AIR = 1.225 #kg/m^3
+RHO_HE = 0.165 # kg/m^3, UHP Helium
 
 DRONE_PROTOTYPE_2_MASS = 46/1000 #kg
 DRONE_PROTOTYPE_0_MASS = 63/1000 #kg
-BALLOON_MASS = .0545/2 #kg
+
+RHO_AIR = 1.225 #kg/m^3
+RHO_HE = 0.165 # kg/m^3
+V_guess = 0.0508
+
+
+
+BALLOON_MASS = .04407 #kg, estimated from volume
+M_AZ = 0.0311 #kg estimated from volume, 1/2*RHO_AIR*V
 m = DRONE_PROTOTYPE_2_MASS + BALLOON_MASS
 
 fb = 9.802 #m/s^2
 G = 9.81 #m/s^2
 VOLTAGE_CONSTANT = .00714
 U_ERROR = 3.0
-MAX_VOLTAGE = 0.4
+MAX_VOLTAGE = 0.6
 MAX_YAW_VOLTAGE = 0.4
 MAX_SK_VOLTAGE = 0.05
 Dz = 0#0.0480
@@ -34,27 +47,28 @@ b = .000980
 
 Fb = m*(G-fb)
 
-H_ENV = 80/100 #m
-H_GON = 4/100 #m
-D_ENV = 81.28/2/100 #m
+H_ENV = 50/100 #m
+H_GON = 6/100 #m
+# D_ENV = 91/100 #m
+D_ENV = 44/100
 
-D_MT = H_ENV/2 + H_GON #distance between CM and gondola
-D_VM = 0.0971 #m, found from paper, distance between CM and Center of lift
+D_VT = H_ENV/2 + H_GON #distance between CM and gondola
+D_VM = 0.184 #m, estimated based on mass and volume, distance between CM and Center of lift
 
-Icm = 0.005821/2 #Icm, should be roughly correct
+Icm = 0.0014 #Icm, estimated based on the GTMAP param applied to the blimp geometry
 
 ###### OPTITRACK PROPERTIES ##########
 
 ALT_OFFSET = 0 #Distance between pivot height and floor
 YAW_OFFSET = 0 #Difference between where 0 yaw is and where it is desired
-PITCH_OFFSET = -0.05
+PITCH_OFFSET = 0#-0.05
 ROLL_OFFSET = 0#0.1
 
 ######################################
 
 ####### PROCESSING ###################
 N_avg_pts = 1
-N_avg_v = 5
+N_avg_v = 4
 
 # LQR CONSTANTS ######################
 Q_alt = np.diag([10.0,5.0])
@@ -64,10 +78,10 @@ R_alt = np.array([[3.0]])
 # R_yaw = np.array([[50.0]])
 
 Q_yaw = np.diag([10.0,5.0])
-R_yaw = np.array([[30.0]])
+R_yaw = np.array([[100.0]])
 
-Q_pitch = np.diag([10.0,10.0,1.0,1.0])
-R_pitch = np.diag([5.0,100.0])
+Q_pitch = np.diag([10.0,1.0,10.0,1.0])
+R_pitch = np.diag([3.0,5.0])
 
 Q_sk = np.diag([10.0,10.0])
 R_sk = np.diag([5.0,5.0])
@@ -81,9 +95,9 @@ B_alt = np.array([[0.0,1/m]]).T # partial wrt u is 1/m
 
 u0_yaw = 0.0 #0 angular velocity, torque around z = 0
 A_yaw = np.array([[0.0, 1.0],[0.0, -1/Icm*Dwy]]) # partial wrt vdot is drag constant (assume linear drag)
-B_yaw = np.array([[0.0,D_MT/Icm]]).T # partial wrt u is 1/m
+B_yaw = np.array([[0.0,D_VT/Icm]]).T # partial wrt u is 1/m
 
-u0_pitch = [0.0,m*(fb-G)*D_VM/D_MT*np.sin(0)] #0 angular velocity, torque around z = 0
+u0_pitch = [0.0,m*(fb-G)*D_VM/D_VT*np.sin(0.3)] #0 angular velocity, torque around z = 0
 A_pitch = np.array([
     [0,0,1,0],
     [0,0,0,1],
@@ -95,7 +109,7 @@ B_pitch = np.array([
     [0 , 0],
     [0 , 0],
     [1/m , 0],
-    [0 , D_MT/Icm]
+    [0 , D_VT/Icm]
 ],dtype=np.float64)
 
 A_sk = np.array([
@@ -123,24 +137,25 @@ class ControllerNode(Node):
         super().__init__(f'controller_node',namespace = ns)
         self.get_logger().info(f"ControllerNode initialized for {ns}")
         self.com_port = com_port
+        self.id = int(ns.split('_')[-1])
         ####################################
         self.publisher = self.create_publisher(MotorMsg,'motor_cmd',5)
         self.subscriber = self.create_subscription(GoalMsg,f'controller/goal',self.update_goal,5)
         self.telemetry = self.create_subscription(OptiTrackPose,f'optitrack_node/pose',self.controller,5)
         self.increment_goal_subscriber = self.create_subscription(GoalMsg,f'controller/goal_inc',self.increment_goal,5)
-        self.fly_to_goal_subscriber = self.create_subscription(Bool, "/fly_to_goal", self.update_fly_to_goal, 5)
-
+        self.fly_to_goal_subscriber = self.create_subscription(TeleopMode, "/fly_to_goal", self.update_fly_to_goal, 5)
+        self.create_subscription(TeleopMode, '/teleop_mode',self.update_teleop_callback, 10)
+        self.create_subscription(Bool, 'start_calibration', self._on_start_calibration, 2)
         ##### CONTROLLERS #############
-        # self.alt_controller = LQR(u0_alt,A_alt,B_alt,Q_alt,R_alt,self)
         self.alt_controller = MPC(u0_alt,A_alt,B_alt,Q_alt,R_alt,5,self)
         self.yaw_controller = MPC(u0_yaw,A_yaw,B_yaw,Q_yaw,R_yaw,5,self)
-        # self.yaw_controller = LQR(u0_yaw,A_yaw,B_yaw,Q_yaw,R_yaw,self)
         self.pitch_controller = MPC_pitch(u0_pitch,A_pitch,B_pitch,Q_pitch,R_pitch,5,self)
-        self.station_keeping = LQR(np.array([0.0,0.0]),A_sk,B_sk,Q_sk,R_sk,self)
+        self.station_keeping = LQR(np.array([0.0,0.0]),A_sk,B_sk,Q_sk,R_sk,self) # unused
         ###### PARAMETERS ################
 
 
 
+        self.calibrating = False
         self.received_goal = False
         self.fly_to_goal = False
         self.xs = []
@@ -152,9 +167,20 @@ class ControllerNode(Node):
 
         self.last_rates = [0.0,0.0,0.0,0.0,0.0] #vx,vy,vz,wy,wz
         self.last_pose = None
-        
-    def update_fly_to_goal(self, msg):
-        self.fly_to_goal = msg.data
+        self.teleop = False
+
+    def _on_start_calibration(self, msg: Bool):
+        self.calibrating = msg.data
+
+    def update_teleop_callback(self, msg): # fly to goal with teleop mode
+        if msg.id == self.id:
+            self.teleop = msg.mode == 2
+            self.fly_to_goal = msg.mode == 2
+
+    def update_fly_to_goal(self, msg): # fly to goal without teleop
+        if msg.id == self.id:
+            self.fly_to_goal = msg.mode == 1
+            self.teleop = False
     
     def increment_goal(self,msg):
         '''
@@ -162,48 +188,53 @@ class ControllerNode(Node):
         msg.z - vertical cmd
         msg.yaw = yaw cmd
         '''
+        if self.last_pose is not None and self.teleop:
+            yaw = self.last_pose[5]
+            dx_world = -msg.x * np.cos(yaw)
+            dy_world = msg.x * np.sin(yaw)
 
-        yaw = self.last_pose[5]
-        dx_world = -msg.x * np.cos(yaw)
-        dy_world = msg.x * np.sin(yaw)
-
-        self.x_goal = np.array([self.last_pose[0] + dx_world,0.0])
-        self.y_goal = np.array([self.last_pose[1] + dy_world,0.0])
-        self.alt_goal = np.array([self.last_pose[2]+msg.z,0.0])
-        self.yaw_goal = np.array([self.last_pose[5]+msg.yaw,0.0])
-        self.pitch_goal = np.array([self.last_pose[4]+msg.pitch,0.0])
-        self.received_goal = True
-        
+            self.x_goal = np.array([self.last_pose[0] + dx_world,0.0])
+            self.y_goal = np.array([self.last_pose[1] + dy_world,0.0])
+            self.alt_goal = np.array([self.last_pose[2]+msg.z,0.0])
+            self.yaw_goal = np.array([self.last_pose[5]+msg.yaw,0.0])
+            self.pitch_goal = np.array([self.last_pose[4]+msg.pitch,0.0])
+            self.received_goal = True
 
 
     def update_goal(self,msg):
-        self.received_goal = True
-        self.x_goal = np.array([msg.x, msg.ux])
-        self.y_goal = np.array([msg.y,msg.uy])
-        self.alt_goal = np.array([msg.z,msg.uz])
-        # self.yaw_goal = np.array([yaw_goal,msg.wz])
-        self.pitch_goal = np.array([msg.pitch,msg.wy])
+        if not self.teleop:
+            self.received_goal = True
+            self.x_goal = np.array([msg.x, msg.ux])
+            self.y_goal = np.array([msg.y,msg.uy])
+            if msg.z < 0.1:
+                self.alt_goal = np.array([msg.z+1.5,msg.uz])
+            else:
+                self.alt_goal = np.array([msg.z+1.5,msg.uz])
+            # self.yaw_goal = np.array([yaw_goal,msg.wz])
+            # self.pitch_goal = np.array([msg.pitch,msg.wy])
+            self.pitch_goal = np.array([0.3,0.0])
 
-        self.pitch_controller.update_u0([0.0,Fb*D_VM/D_MT*np.sin(msg.pitch)])
+            self.pitch_controller.update_u0([0.0,Fb*D_VM/D_VT*np.sin(msg.pitch)])
 
 
     def controller(self,msg):
+        if self.calibrating:
+            return
         mtr = [0.0]*6
+        blimp_id = msg.id
+        x,y,alt,roll,pitch,yaw,t = (msg.x,msg.y,msg.z,msg.roll,msg.pitch,msg.yaw,msg.time)
+        self.last_pose = (x,y,alt,roll,pitch,yaw)
         if self.received_goal and self.fly_to_goal:
             # build measurement matrix
-            blimp_id = msg.id
-            x,y,alt,roll,pitch,yaw,t = (msg.x,msg.y,msg.z,msg.roll,msg.pitch,msg.yaw,msg.time)
-            self.last_pose = (x,y,alt,roll,pitch,yaw)
-            self.get_logger().info(f" Flying to goal: {self.x_goal[0]}, {self.y_goal[0]}, {self.alt_goal[0]}")
+            if not self.teleop:
+                dx = self.x_goal[0] - x
+                dy = self.y_goal[0] - y
+                yaw_goal = np.arctan2(dy,-dx)
+                if yaw_goal < 0:
+                    yaw_goal += 2*np.pi
 
-            dx = self.x_goal[0] - x
-            dy = self.y_goal[0] - y
-            yaw_goal = np.arctan2(dy,-dx)
-            if yaw_goal < 0:
-                yaw_goal += 2*np.pi
-
-            self.yaw_goal = np.array([yaw_goal,0.0])
-            self.get_logger().info(f"Yaw goal: {self.yaw_goal}, current yaw: {yaw}")
+                self.yaw_goal = np.array([yaw_goal,0.0])
+            # self.get_logger().info(f"Yaw goal: {self.yaw_goal}, current yaw: {yaw}")
 
             self.yaws.append(yaw)
             self.pitches.append(pitch)
@@ -255,7 +286,6 @@ class ControllerNode(Node):
                 if abs((yaw-YAW_OFFSET)-self.yaw_goal[0]) < 0.2 and abs(wz) < 0.1: # only fly forward when yaw is stable
                     state = np.array([0.0,pitch-PITCH_OFFSET]) #pose is 0 because goal is relative to the blimp
                     #full state is [x,theta,xdot,thetadot]
-
                     dist_goal = np.sqrt( self.x_goal[0]**2 + self.y_goal[0]**2)
                     velocity_goal = np.sqrt( self.x_goal[1]**2 + self.y_goal[1]**2 )
                 
@@ -360,6 +390,16 @@ class LQR(object):
     def update_u0(self,new_u0):
         self.u0 = new_u0
 
+    def update_gains(self, Q, R):
+        Q = np.asarray(Q, dtype=np.float64)
+        R = np.asarray(R, dtype=np.float64)
+        assert Q.shape == self.Q.shape, f"Q shape {Q.shape} != expected {self.Q.shape}"
+        assert R.shape == self.R.shape, f"R shape {R.shape} != expected {self.R.shape}"
+        self.Q = Q
+        self.R = R
+        P = solve_continuous_are(self.A, self.B, self.Q, self.R)
+        self.K = np.linalg.inv(self.R) @ self.B.T @ P
+
 class MPC(object):
     '''
     MPC Control using tinyMPC
@@ -374,17 +414,38 @@ class MPC(object):
         Ad, Bd, _, _, _ = \
                     cont2discrete((A, B, np.eye(A.shape[0]), np.zeros((A.shape[0], B.shape[1]))), dt, method='zoh')
 
+        self.Ad = Ad
+        self.Bd = Bd
+        self.Q = np.asarray(Q, dtype=np.float64)
+        self.R = np.asarray(R, dtype=np.float64)
+        self.N = N
+        self.rho = 1.0
+
         self.solver = tinympc.TinyMPC()
+        # Protects TinyMPC C++ state from concurrent solve/setup under MultiThreadedExecutor
+        self.solver_lock = threading.Lock()
         # self.solver.set_x_ref([self.node.x_goal[0],self.node.pitch_goal[0],self.node.x_goal[1],self.pitch_goal[1]])
         self.u0 = [u0]
-        self.solver.setup(Ad,Bd,Q,R,N,verbose=False)
+        self.solver.setup(self.Ad,self.Bd,self.Q,self.R,self.N,rho=self.rho,verbose=False)
         self.solver.set_u_ref(np.array(self.u0))
-        
+
 
         self.thrust_to_voltage = lambda thrust: thrust/abs(thrust) * np.sqrt(abs(thrust))/VOLTAGE_CONSTANT/100
 
     def update_u0(self,new_u0):
         self.u0 = new_u0
+
+    def update_gains(self, Q, R):
+        Q = np.asarray(Q, dtype=np.float64)
+        R = np.asarray(R, dtype=np.float64)
+        assert Q.shape == self.Q.shape, f"Q shape {Q.shape} != expected {self.Q.shape}"
+        assert R.shape == self.R.shape, f"R shape {R.shape} != expected {self.R.shape}"
+        with self.solver_lock:
+            self.Q = Q
+            self.R = R
+            # TinyMPC has no in-place Q/R update — rerun setup to rebuild the solver with new cost matrices
+            self.solver.setup(self.Ad, self.Bd, self.Q, self.R, self.N, rho=self.rho, verbose=False)
+            self.solver.set_u_ref(np.array(self.u0))
 
     def control_output(self,pose,goal,wrap=False):
 
@@ -397,11 +458,11 @@ class MPC(object):
             state[0] = 0.0 #goal is now relative to current state so set=0
             local_goal[0] = d
 
-        self.solver.set_x0(state)
-        self.solver.set_u_ref(np.array(self.u0))
-        self.solver.set_x_ref(local_goal)
-
-        thrust = self.solver.solve()['controls'][0]
+        with self.solver_lock:
+            self.solver.set_x0(state)
+            self.solver.set_u_ref(np.array(self.u0))
+            self.solver.set_x_ref(local_goal)
+            thrust = self.solver.solve()['controls'][0]
         u = self.thrust_to_voltage(thrust)
         if abs(u) > U_ERROR:
             return 0
@@ -420,16 +481,35 @@ class MPC_pitch(object):
         Ad, Bd, _, _, _ = \
                     cont2discrete((A, B, np.eye(A.shape[0]), np.zeros((A.shape[0], B.shape[1]))), dt, method='zoh')
 
+        self.Ad = Ad
+        self.Bd = Bd
+        self.Q = np.asarray(Q, dtype=np.float64)
+        self.R = np.asarray(R, dtype=np.float64)
+        self.N = N
+        self.rho = 1.0
+
         self.solver = tinympc.TinyMPC()
+        self.solver_lock = threading.Lock()
         # self.solver.set_x_ref([self.node.x_goal[0],self.node.pitch_goal[0],self.node.x_goal[1],self.pitch_goal[1]])
         self.u0 = u0
-        self.solver.setup(Ad,Bd,Q,R,N,rho=1.0,verbose=False)
+        self.solver.setup(self.Ad,self.Bd,self.Q,self.R,self.N,rho=self.rho,verbose=False)
         self.solver.set_u_ref(np.array(self.u0))
 
         self.thrust_to_voltage = lambda thrust: thrust/abs(thrust) * np.sqrt(abs(thrust))/VOLTAGE_CONSTANT/100
 
     def update_u0(self,new_u0):
         self.u0 = new_u0
+
+    def update_gains(self, Q, R):
+        Q = np.asarray(Q, dtype=np.float64)
+        R = np.asarray(R, dtype=np.float64)
+        assert Q.shape == self.Q.shape, f"Q shape {Q.shape} != expected {self.Q.shape}"
+        assert R.shape == self.R.shape, f"R shape {R.shape} != expected {self.R.shape}"
+        with self.solver_lock:
+            self.Q = Q
+            self.R = R
+            self.solver.setup(self.Ad, self.Bd, self.Q, self.R, self.N, rho=self.rho, verbose=False)
+            self.solver.set_u_ref(np.array(self.u0))
 
     def control_output(self,pose,goal,v,wy):
 
@@ -438,11 +518,11 @@ class MPC_pitch(object):
 
         state = np.array([d,theta,v,wy])
 
-        self.solver.set_x0(state)
-        self.solver.set_u_ref(np.array(self.u0))
-        self.solver.set_x_ref(goal)
-
-        thrust = self.solver.solve()['controls']
+        with self.solver_lock:
+            self.solver.set_x0(state)
+            self.solver.set_u_ref(np.array(self.u0))
+            self.solver.set_x_ref(goal)
+            thrust = self.solver.solve()['controls']
         thrust = thrust[0]
 
         u = self.thrust_to_voltage(thrust)

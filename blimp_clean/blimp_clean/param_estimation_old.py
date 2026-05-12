@@ -10,41 +10,13 @@ import threading
 
 import tinympc
 import time
-
-'''
-Things done:
-- Create a simulation to ensure that the logic was functioning
-- Made an inital parameter estimator using real-world estimates
-- Implemented an MPC controller via estimates to see performance
-- Measurement gate via test statistic
-- Used NIS to tune Q and R based on the consistency
-    - Decreased the variance of R when NIS was consistently outside the bounds
-    -
-'''
-
-
-
 RHO_AIR = 1.225 #kg/m^3
 RHO_HE = 0.165 # kg/m^3
 M_chassis = 46/1000 #kg
-M_AZ = 0.0311 #kg
+M_AZ = 0.0545/2 #kg
 g = 9.81
 
-# 50 cm tall
-# 91.44 cm across
-
-V_guess = 0.0508
-Kv_guess = 0.714
-Cd_guess = 0.0100
-
-# V_guess = 0.05534
-# Kv_guess = 0.004782
-# Cd_guess = 0.01108
-
-
 MAX_VOLTAGE = 0.8
-
-
 
 class Model(object):
     def __init__(self, d0=0.0):
@@ -53,21 +25,20 @@ class Model(object):
 
         '''
         self.d0 = d0
-        self.m = M_chassis + RHO_HE*V_guess + M_AZ
+        V0 = 0.0514
+        self.m = M_chassis + RHO_HE*V0 + M_AZ
         self.m_RB = self.m - M_AZ
     
     def get_FG(self,X, d, dt, d0):
         
         z, zdot, V, Kv, Cd = X
-
-        # Update mass estimates
         self.m = M_chassis + RHO_HE*V + M_AZ
         self.m_RB = self.m - M_AZ
 
         u = d
 
         # Derivative w.r.t volume (parameter is on LHS and RHS, quotient rule)
-        N = (RHO_AIR - RHO_HE)*g*V - M_chassis*g + 2*Kv*(u - d0) - Cd*zdot # RHS
+        N = (RHO_AIR - RHO_HE)*g*V - self.m_RB*g + 2*Kv*(u - d0) - Cd*zdot # RHS
         dN_dV = (RHO_AIR - 2*RHO_HE)*g #Derviative wrt RHS
         dm_dV = RHO_HE # Derivative w.r.t mass
         dV = (dN_dV*self.m - N*dm_dV) / self.m**2 #Quotient rule
@@ -75,7 +46,7 @@ class Model(object):
         # Make F and G
         F = np.array([
             [1, dt, 0, 0, 0],
-            [0, 1 - 1/self.m * Cd * dt, dV*dt, 2/self.m*(u-d0)*dt, -zdot/self.m*dt],
+            [0, 1 - 1/self.m * Cd * dt, dV*dt, 1/self.m*(u-d0)*dt, -zdot/self.m*dt],
             [0, 0, 1, 0, 0],
             [0, 0, 0, 1, 0],
             [0, 0, 0, 0, 1]
@@ -107,37 +78,39 @@ class ParamEstimation(Node):
         # Initializers
         self.run_calibration = False
         self.finished_calibration = False
-        self.measure_v = False
+        self.measure_v = True
 
 
-
+        # Initial values and model
+        V0 = 0.0514 
+        Kv0 = 0.714
+        Dz0 = 0.0480
+        # V0 = 0.010816676121561977
+        # Kv0 = 0.4589
+        # Dz0 = 0.6227
         self.d0 = 0.0
         self.N_avg = 1
-        self.N_ts = 15
-        self.N_update_goal = 10
+        self.N_ts = 10
 
-        self.count_measurements = 0
-
-        self.X = [0.0,0.0,V_guess, Kv_guess, Cd_guess] # Tracks the current position and parameters
+        self.X = [0.0,0.0,V0, Kv0, Dz0] # Tracks the current position and parameters
         self.model = Model()
 
         #Initialize controller
         # self.controller = LQR()
         self.controller = MPC(5,self)
-        self.alt_goal = 1.5
 
         # Tracking
         self.last_time = None
         self.last_z = None
+        self.zs = []
+        self.times = []
         self.update_lock = threading.Lock()
-        self.saved = False
 
         # Plotting
         self.state_estimates = []
         self.covariance_estimates = []
         self.test_statistics = []
         self.avg_test_statistics = []
-        self.innovations = []
 
         self.last_P = None
 
@@ -150,13 +123,13 @@ class ParamEstimation(Node):
                 [0, 1, 0, 0, 0]
             ])
 
-            self.R = np.diag([0.001**2,0.075**2]) # Uncertainty in measurements
+            self.R = np.diag([0.01**2,0.1**2]) # Uncertainty in measurements
         else:
             self.H = np.array([[1,0,0,0,0]])
-            self.R = np.array([[0.001**2]])
+            self.R = np.array([[0.01**2]])
 
-        self.Q = np.eye(1)*0.1**2 # Uncertainty in model
-        self.P = P = np.diag([0.1**2, 0.5**2, 0.05**2, 1.0**2, 0.2**2]) # Uncertainty in estimate
+        self.Q = np.eye(1)*0.5**2 # Uncertainty in model
+        self.P = P = np.diag([0.1**2, 1.0**2, 1.0**2, 5.0**2, 1.0**2]) # Uncertainty in estimate
 
 
 
@@ -165,11 +138,9 @@ class ParamEstimation(Node):
 
     def ekf(self, msg):
         if not self.finished_calibration:
-            # if len(self.zs)==self.N_avg:
-            if self.last_z is not None:
-                self.count_measurements += 1
-                dt = msg.time - self.last_time
-                v = (msg.z - self.last_z) / dt
+            if len(self.zs)==self.N_avg:
+                dt = msg.time - self.times[0] 
+                v = (msg.z - self.zs[0]) / dt
                 if abs(v) > 1.5:
                     return
 
@@ -177,21 +148,18 @@ class ParamEstimation(Node):
                     measurement = np.array([msg.z,v])
                 else:
                     measurement = msg.z
-
                 self.X[0] = msg.z
                 self.X[1] = v
+
+                self.zs = []
+                self.times = []
 
 
                 if self.run_calibration:
                     with self.update_lock:
                         t0 = time.time()
-                        
-                        #Update goal every 10 msmts to get some level of velocity
-                        if self.count_measurements % self.N_update_goal == 0:
-                            self.alt_goal = np.random.uniform(1.0, 2.0)
-
                         # Get voltage output
-                        u = self.controller.get_control(self.X, np.array([self.alt_goal, 0.0]))
+                        u = self.controller.get_control(self.X,np.array([1.5,0.0]))
                         run_ekf = True
                         if run_ekf:
 
@@ -216,83 +184,59 @@ class ParamEstimation(Node):
 
                             # Innovation
                             nu = measurement - self.H@Xp
+                            self.get_logger().info(f'Shapes: {nu.shape, S.shape}\n\n\n')
                             test_statistic = nu.T @ np.linalg.inv(S) @ nu
-                            # INSERT_YOUR_CODE
-                            # 95% chi2inv with 2 measurements
-                            if self.measure_v:
-                                chi2_threshold = 5.991  # For 2 DOF, 95% confidence interval
-                            else:
-                                chi2_threshold = 3.841
 
-                    
-                            if test_statistic < chi2_threshold:
-                                self.innovations.append(nu.squeeze())
+                            #Update
+                            self.X = Xp + K @ nu
+                            self.P = (np.eye(5) - K@self.H)@Pp@(np.eye(5)-K@self.H).T + K@self.R@K.T
 
-                                #Update
-                                self.X = Xp + K @ nu
-                                self.P = (np.eye(5) - K@self.H)@Pp@(np.eye(5)-K@self.H).T + K@self.R@K.T
+                            self.X[2] = max(1e-6, self.X[2])
+                            self.X[3] = max(1e-6, self.X[3])
+                            self.X[4] = max(1e-6, self.X[4])
 
-                                self.X[2] = max(1e-6, self.X[2])
-                                self.X[3] = max(1e-6, self.X[3])
-                                self.X[4] = max(1e-6, self.X[4])
+                            self.state_estimates.append(self.X)
+                            self.covariance_estimates.append(self.P)
+                            self.test_statistics.append(test_statistic)
 
-                                self.state_estimates.append(self.X)
-                                self.covariance_estimates.append(self.P)
-                                self.test_statistics.append(test_statistic)
+                            if len(self.test_statistics) > self.N_ts:
+                                self.avg_test_statistics.append(np.mean(self.test_statistics[-self.N_ts:]))
 
-                                if len(self.test_statistics) > self.N_ts:
-                                    NIS = np.mean(self.test_statistics[-self.N_ts:])
-                                    self.avg_test_statistics.append(NIS)
-
-                                if len(self.innovations) > self.N_ts:
-                                    window = self.innovations[-self.N_ts:]
-                                    
-                                    mean_inn = np.mean(window)
-                                    autocorr = np.corrcoef(window[:-1], window[1:])[0,1]
-
-                                    self.get_logger().info(f'Mean innovation: {mean_inn}, Autocorrelation: {autocorr}')
-
-                                    if abs(mean_inn) < 1e-6 and abs(autocorr) < 0.05:
-                                        self.finished_calibration = True
-                                        self.finished_time = msg.time
-                                        self.get_logger().info(f'Estimated V: {self.X[2]}, Kv: {self.X[3]}, Cd: {self.X[4]}')                        
-
-                                        for i in range(10):
-                                            cmd = MotorMsg()
-                                            cmd.id = msg.id
-                                            cmd.com = self.com
-                                            cmd.voltages = Float32MultiArray(data=list(np.array([0.0,0.0,0.0,0.0,0.0,0.0])))
-                                            self.motor_pub.publish(cmd) 
-                                        return
+                            if self.last_P is not None and np.linalg.norm(self.P[2:, 2:] - self.last_P[2:,2:]) < 1e-6:
+                                self.finished_calibration = True
+                                self.finished_time = msg.time
+                                self.get_logger().info(f'Estimated V: {self.X[2]}, Kv: {self.X[3]}, Cd: {self.X[4]}')
                                 
-                                self.last_P = self.P
-
-                                # Publish motor command and visualization messages
-                                self.covar_pub.publish(msg=Float32MultiArray(data=list(self.P.flatten())))
-                                self.pred_pub.publish(msg=Float32MultiArray(data=list(self.X.flatten())))
+                                for i in range(10):
+                                    cmd = MotorMsg()
+                                    cmd.id = msg.id
+                                    cmd.com = self.com
+                                    cmd.voltages = Float32MultiArray(data=list(np.array([0.0,0.0,0.0,0.0,0.0,0.0])))
+                                    self.motor_pub.publish(cmd) 
+                                return
+                            
+                            self.last_P = self.P
+                            # Publish motor command and visualization messages
+                            self.covar_pub.publish(msg=Float32MultiArray(data=list(self.P.flatten())))
+                            self.pred_pub.publish(msg=Float32MultiArray(data=list(self.X.flatten())))
 
                             cmd = MotorMsg()
                             cmd.id = msg.id
                             cmd.com = self.com
                             cmd.voltages = Float32MultiArray(data=list(np.array([0.0,0.0,u,-u,0.0,0.0])))
                             self.motor_pub.publish(cmd) 
-        # else:
-        #     self.zs.append(msg.z)
-        #     self.times.append(msg.time)
+                            self.get_logger().info(f'Currently running at {round(1/(time.time()-t0),1)}Hz')
+            else:
+                self.zs.append(msg.z)
+                self.times.append(msg.time)
         
         else:
-            if not self.saved:
-                os.makedirs(self.ns, exist_ok=True)
-                self.get_logger().info(f'Saving... {len(self.avg_test_statistics)}')
-                np.save(self.ns + '/state_estimates.npy', self.state_estimates)
-                np.save(self.ns + '/covariance_estimates.npy', self.covariance_estimates)
-                np.save(self.ns + '/finished_time.npy', self.finished_time)
-                np.save(self.ns + '/test_statistics.npy', self.test_statistics)
-                np.save(self.ns + '/avg_test_statistics.npy', self.avg_test_statistics)
-                self.saved = True
-
-        self.last_time = msg.time
-        self.last_z = msg.z
+            os.makedirs(self.ns, exist_ok=True)
+            np.save(self.ns + '/state_estimates.npy', self.state_estimates)
+            np.save(self.ns + '/covariance_estimates.npy', self.covariance_estimates)
+            np.save(self.ns + '/finished_time.npy', self.finished_time)
+            np.save(self.ns + '/test_statistics.npy', self.test_statistics)
+            np.save(self.ns + '/avg_test_statistics.npy', self.avg_test_statistics)
 
 
 class MPC(object):
@@ -308,25 +252,26 @@ class MPC(object):
         dt = 1/(100/node.N_avg)
         # Ad, Bd, _, _, _ = \
         #             cont2discrete((A, B, np.eye(A.shape[0]), np.zeros((A.shape[0], B.shape[1]))), dt, method='zoh')
-        m = M_chassis + RHO_HE*V_guess + M_AZ
+        V = 0.0514 
+        self.Kv = 0.714
+        Cd = 0.0480
+        m = M_chassis + RHO_HE*V + M_AZ
         m_RB = m - M_AZ
 
         A = np.array([
             [1, dt],
-            [0, 1 - Cd_guess/m*dt]
+            [0, 1 - Cd/m*dt]
         ])
         B = np.array([
             [0],
             [dt/m]
         ])
 
-        Fb = (RHO_AIR-RHO_HE)*g*V_guess
-        self.node.get_logger().info(f'Estimated net buoyancy force: {Fb}')
-        u0 = M_chassis*g - Fb
-        self.node.get_logger().info(f'Diff between gravity and buoyancy: {u0}')
+        Fb = (RHO_AIR-RHO_HE)*g*V
+        u0 = m_RB*g - Fb
 
         Q_alt = np.diag([10.0,5.0])
-        R_alt = np.array([[1.0]])
+        R_alt = np.array([[3.0]])
 
         self.Ad = A
         self.Bd = B
@@ -343,6 +288,9 @@ class MPC(object):
         self.solver.setup(self.Ad,self.Bd,self.Q,self.R,self.N,rho=self.rho,verbose=False)
         self.solver.set_u_ref(np.array(self.u0))
 
+
+        self.thrust_to_voltage = lambda thrust: thrust/abs(thrust) * np.sqrt(abs(thrust))/VOLTAGE_CONSTANT/100
+
     def update_u0(self,new_u0):
         self.u0 = new_u0
 
@@ -357,14 +305,16 @@ class MPC(object):
             self.solver.set_x_ref(local_goal)
             thrust = self.solver.solve()['controls'][0]
 
-        u = thrust/Kv_guess
+        u = thrust/self.Kv
+        # if abs(u) > U_ERROR:
+        #     return 0
 
         return u/abs(u)*min(abs(u),MAX_VOLTAGE)
 
 class LQR(object):
     def __init__(self):
-        self.Q = np.diag([10.0,5.0])
-        self.R = np.array([[100.0]])
+        self.Q = np.diag([10.0,2.0])
+        self.R = np.array([[5.0]])
         # self.desired_poles = (-1.5, -1.33)
     
     def get_AB(self, X, dt, m):
@@ -383,15 +333,18 @@ class LQR(object):
 
     def pole_placement(self, X, dt, d0):
         z, zdot, *_ = X
-        Xi = [z,zdot,V_guess,Kv_guess,Cd_guess]
+        V = 0.0514 
+        Kv = 0.714
+        Dz = 0.0480
+        Xi = [z,zdot,V,Kv,Dz]
 
-        m = M_chassis + RHO_HE*V_guess + M_AZ
+        m = M_chassis + RHO_HE*V + M_AZ
         m_RB = m - M_AZ
 
         Xc = np.array(X[:2]).reshape((2,1))
         goal = np.array([[1.0],[0.0]])
 
-        Fb = (RHO_AIR-RHO_HE)*g*V_guess
+        Fb = (RHO_AIR-RHO_HE)*g*V
         u0 = m_RB*g - Fb
 
         A, B = self.get_AB(Xi, dt, m)
@@ -408,7 +361,10 @@ class LQR(object):
         V = 0.0514 
         Kv = 0.714
         Dz = 0.0480
-
+        # v = 0.0514 
+        # V = 0.010816676121561977
+        # Kv = 0.4589
+        # Cd = 0.6227
         m = M_chassis + RHO_HE*V + M_AZ
         m_RB = m - M_AZ
 
